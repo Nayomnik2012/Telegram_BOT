@@ -1,5 +1,6 @@
 import logging
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+import settings
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
                     level=logging.INFO,
@@ -14,7 +15,7 @@ def chat(bot, update):
     update.message.reply_text('Hello!')
 
 def main():
-    updtr = Updater('717979594:AAG4mWBvGaSIWpRb303ui9nBFl8px5u8QIw')
+    updtr = Updater(settings.TELEGRAM_API_KEY)
     updtr.dispatcher.add_handler(CommandHandler("start", start_bot))
     updtr.dispatcher.add_handler(MessageHandler(Filters.text, chat))
     updtr.start_polling()
