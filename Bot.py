@@ -4,7 +4,7 @@ from aiogram.utils import executor
 from aiohttp import web
 import asyncio
 
-API_TOKEN = '513563991:AAHWLkZJ7muloN4dkanbcgPZmWb4KjJ2omg'
+API_TOKEN = os.environ.get('BOT_TOKEN')
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
