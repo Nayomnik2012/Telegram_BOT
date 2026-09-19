@@ -1,5 +1,5 @@
 """
-Telegram-бот: белый список, заявки на доступ, проекты и команда проекта. Тест1
+Telegram-бот: белый список, заявки на доступ, проекты и команда проекта.
 
 Переменные окружения (Render -> Environment):
     BOT_TOKEN   - токен от @BotFather                       (обязательно)
@@ -33,7 +33,7 @@ from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup as Markup
 from telegram import Message, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Conflict, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1354,6 +1354,11 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, Conflict):
+        # Второй экземпляр бота с этим токеном (обычно — старый деплой на пару секунд).
+        # Опрос продолжится сам, когда он остановится, поэтому без traceback.
+        log.warning("Conflict: с этим токеном ещё работает другой экземпляр бота")
+        return
     log.error("Ошибка при обработке обновления", exc_info=context.error)
 
 
