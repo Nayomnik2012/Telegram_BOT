@@ -695,7 +695,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         position = "" if text == "-" else text[:100]
         context.user_data["state"] = ("add_member_desc", state[1], state[2], position)
         await update.message.reply_text(
-            "Теперь отправьте <b>Проекты</b> (или «-», чтобы оставить пустым):",
+            "Теперь отправьте <b>описание</b> (или «-», чтобы оставить пустым):",
             parse_mode=HTML,
         )
         return
