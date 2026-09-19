@@ -313,7 +313,7 @@ async def show_project(context, chat_id: int, uid: int, pid: int, replace: Messa
     docs = p["docs_url"] or DOCS_URL
     if docs:
         rows.append([Btn("📚 Документация по проектам", url=docs)])
-    rows.append([Btn(f"❓ {faq_title_of(p)}"[:64], callback_data=f"faq:{pid}")])
+    rows.append([Btn(f"ℹ️ {faq_title_of(p)}"[:64], callback_data=f"faq:{pid}")])
     if get_role(uid) in MANAGERS:
         rows += [
             [
@@ -360,7 +360,7 @@ async def show_faq(context, chat_id: int, uid: int, pid: int, replace: Message |
     items = many("SELECT id, title FROM faq WHERE project_id=? ORDER BY id", pid)
     is_mgr = get_role(uid) in MANAGERS
 
-    rows = [[Btn(f"❓ {i['title']}"[:60], callback_data=f"fq:{i['id']}")] for i in items]
+    rows = [[Btn(f"ℹ️ {i['title']}"[:60], callback_data=f"fq:{i['id']}")] for i in items]
     if is_mgr:
         rows.append(
             [
@@ -370,7 +370,7 @@ async def show_faq(context, chat_id: int, uid: int, pid: int, replace: Message |
         )
     rows += nav_rows(pid, f"prj:{pid}")
 
-    text = f"❓ <b>{esc(faq_title_of(p))}</b>\n📁 {esc(p['name'])}"
+    text = f"ℹ️ <b>{esc(faq_title_of(p))}</b>\n📁 {esc(p['name'])}"
     if not items:
         text += "\n\nПока нет ни одного вопроса."
         if is_mgr:
