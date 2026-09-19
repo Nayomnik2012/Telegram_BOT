@@ -309,6 +309,22 @@ async def ask(context, chat_id: int, msg: Message, text: str, state: tuple):
 # ───────────────────────── Заявки на доступ ─────────────────────────
 
 
+USERNAME_RE = re.compile(r"[A-Za-z0-9_]{5,32}")
+LINK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/([A-Za-z0-9_]{5,32})/?(?:\?\S*)?", re.I
+)
+
+
+def extract_username(token: str) -> str | None:
+    """Принимает @nick, nick или ссылку t.me/nick и возвращает username без @."""
+    token = token.strip()
+    m = LINK_RE.fullmatch(token)
+    if m:
+        return m.group(1)
+    token = token.lstrip("@")
+    return token if USERNAME_RE.fullmatch(token) else None
+
+
 def user_link(uid: int, full_name: str) -> str:
     return f'<a href="tg://user?id={uid}">{esc(full_name)}</a>'
 
@@ -472,8 +488,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif cmd == "prj_addm":
         await ask(
             context, chat_id, msg,
-            "Отправьте @username и должность одним сообщением, например:\n"
-            "<code>@ivan_petrov Руководитель проекта</code>",
+            "Отправьте @username (или ссылку t.me) и должность одним сообщением, например:\n"
+            "<code>@ivan_petrov Руководитель проекта</code>\n"
+            "<code>https://t.me/ivan_petrov Руководитель проекта</code>",
             ("add_member", int(a[0])),
         )
     elif cmd == "prj_delm":
@@ -583,10 +600,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         run("UPDATE projects SET description=? WHERE id=?", "" if text == "-" else text, state[1])
     elif kind == "add_member":
         parts = text.split(None, 1)
-        username = parts[0].lstrip("@") if parts else ""
-        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        username = extract_username(parts[0]) if parts else None
+        if not username:
             return await update.message.reply_text(
-                "Не похоже на username. Формат: <code>@username Должность</code>", parse_mode=HTML
+                "Не похоже на username. Формат: <code>@username Должность</code>\n"
+                "Можно также прислать ссылку: <code>https://t.me/username Должность</code>",
+                parse_mode=HTML,
             )
         position = parts[1].strip()[:100] if len(parts) > 1 else ""
         run(
