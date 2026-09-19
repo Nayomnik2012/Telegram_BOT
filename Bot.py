@@ -6,6 +6,7 @@ Telegram-бот: белый список, заявки на доступ, про
     ADMIN_IDS   - Telegram ID администратора(ов) через запятую (обязательно)
     MENU_IMAGE  - URL картинки для меню                      (необязательно)
     DB_PATH     - путь к файлу базы, например /data/bot.db    (необязательно)
+    AUTO_BACKUP - 0 отключает автокопии базы админу (по умолчанию включены)
     DOCS_URL    - ссылка на Confluence для кнопки «Документация по проектам»
                   по умолчанию (у проекта можно задать свою)     (необязательно)
 
@@ -13,15 +14,18 @@ Telegram-бот: белый список, заявки на доступ, про
 либо положить файл menu.jpg рядом с bot.py.
 """
 
+import asyncio
 import html
 import logging
 import os
 import re
 import sqlite3
+import tempfile
 import textwrap
 import threading
 import time
 import urllib.request
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -61,6 +65,19 @@ DB_PATH = os.environ.get("DB_PATH") or ("/data/bot.db" if Path("/data").is_dir()
 KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
 KEEPALIVE_INTERVAL = 300  # секунд (5 минут)
 
+# Резервные копии. Бот присылает копию базы админам и закрепляет её в их личном чате.
+# Если на Render файловая система сбросилась и база пустая — при старте бот сам
+# достаёт закреплённую копию и восстанавливает данные.
+AUTO_BACKUP = os.environ.get("AUTO_BACKUP", "1") != "0"
+BACKUP_QUIET = 30  # секунд без изменений в базе, после которых отправляется автокопия
+BACKUP_PREFIX = "bot-backup-"
+try:
+    from zoneinfo import ZoneInfo
+
+    TZ = ZoneInfo("Europe/Kyiv")
+except Exception:  # нет базы часовых поясов — используем время сервера
+    TZ = None
+
 # Общая ссылка на документацию (Confluence). У каждого проекта можно задать свою
 # прямо в боте (кнопка «Ссылка на документацию»), тогда будет использоваться она.
 DOCS_URL = os.environ.get("DOCS_URL", "").strip()
@@ -82,79 +99,89 @@ esc = html.escape
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.execute("PRAGMA foreign_keys = ON")
-db.executescript(
-    """
-    CREATE TABLE IF NOT EXISTS users(
-        user_id   INTEGER PRIMARY KEY,
-        username  TEXT,
-        full_name TEXT,
-        role      TEXT NOT NULL DEFAULT 'user'          -- user | deputy
-    );
-    CREATE TABLE IF NOT EXISTS requests(
-        user_id   INTEGER PRIMARY KEY,
-        username  TEXT,
-        full_name TEXT,
-        status    TEXT NOT NULL                          -- pending | approved | rejected
-    );
-    CREATE TABLE IF NOT EXISTS notifications(
-        user_id    INTEGER,
-        chat_id    INTEGER,
-        message_id INTEGER
-    );
-    CREATE TABLE IF NOT EXISTS projects(
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        name        TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        docs_url    TEXT NOT NULL DEFAULT '',
-        faq_title   TEXT NOT NULL DEFAULT ''
-    );
-    CREATE TABLE IF NOT EXISTS members(
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        username    TEXT NOT NULL,
-        position    TEXT NOT NULL DEFAULT '',
-        description TEXT NOT NULL DEFAULT ''
-    );
-    CREATE TABLE IF NOT EXISTS faq(
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        title       TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        docs_url    TEXT NOT NULL DEFAULT '',
-        parent_id   INTEGER REFERENCES faq(id) ON DELETE CASCADE   -- NULL = верхний уровень
-    );
-    CREATE TABLE IF NOT EXISTS settings(
-        key   TEXT PRIMARY KEY,
-        value TEXT
-    );
-    """
-)
-db.commit()
-
-# Миграция: колонка «Описание» для уже существующей базы (старые данные сохраняются)
-if "description" not in {r["name"] for r in db.execute("PRAGMA table_info(members)")}:
-    db.execute("ALTER TABLE members ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+def ensure_schema() -> None:
+    """Создаёт таблицы и добавляет недостающие колонки (при старте и после восстановления)."""
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users(
+            user_id   INTEGER PRIMARY KEY,
+            username  TEXT,
+            full_name TEXT,
+            role      TEXT NOT NULL DEFAULT 'user'          -- user | deputy
+        );
+        CREATE TABLE IF NOT EXISTS requests(
+            user_id   INTEGER PRIMARY KEY,
+            username  TEXT,
+            full_name TEXT,
+            status    TEXT NOT NULL                          -- pending | approved | rejected
+        );
+        CREATE TABLE IF NOT EXISTS notifications(
+            user_id    INTEGER,
+            chat_id    INTEGER,
+            message_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS projects(
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            docs_url    TEXT NOT NULL DEFAULT '',
+            faq_title   TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS members(
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            username    TEXT NOT NULL,
+            position    TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS faq(
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            title       TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            docs_url    TEXT NOT NULL DEFAULT '',
+            parent_id   INTEGER REFERENCES faq(id) ON DELETE CASCADE   -- NULL = верхний уровень
+        );
+        CREATE TABLE IF NOT EXISTS settings(
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """
+    )
     db.commit()
 
-# Миграция: ссылка на документацию у проекта
-if "docs_url" not in {r["name"] for r in db.execute("PRAGMA table_info(projects)")}:
-    db.execute("ALTER TABLE projects ADD COLUMN docs_url TEXT NOT NULL DEFAULT ''")
-    db.commit()
+    # Миграция: колонка «Описание» для уже существующей базы (старые данные сохраняются)
+    if "description" not in {r["name"] for r in db.execute("PRAGMA table_info(members)")}:
+        db.execute("ALTER TABLE members ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        db.commit()
 
-# Миграция: название кнопки «Часто задаваемые вопросы» у проекта
-if "faq_title" not in {r["name"] for r in db.execute("PRAGMA table_info(projects)")}:
-    db.execute("ALTER TABLE projects ADD COLUMN faq_title TEXT NOT NULL DEFAULT ''")
-    db.commit()
+    # Миграция: ссылка на документацию у проекта
+    if "docs_url" not in {r["name"] for r in db.execute("PRAGMA table_info(projects)")}:
+        db.execute("ALTER TABLE projects ADD COLUMN docs_url TEXT NOT NULL DEFAULT ''")
+        db.commit()
 
-# Миграция: вложенные кнопки (директории) внутри «Часто задаваемых вопросов»
-if "parent_id" not in {r["name"] for r in db.execute("PRAGMA table_info(faq)")}:
-    db.execute("ALTER TABLE faq ADD COLUMN parent_id INTEGER REFERENCES faq(id) ON DELETE CASCADE")
-    db.commit()
+    # Миграция: название кнопки «Часто задаваемые вопросы» у проекта
+    if "faq_title" not in {r["name"] for r in db.execute("PRAGMA table_info(projects)")}:
+        db.execute("ALTER TABLE projects ADD COLUMN faq_title TEXT NOT NULL DEFAULT ''")
+        db.commit()
+
+    # Миграция: вложенные кнопки (директории) внутри «Часто задаваемых вопросов»
+    if "parent_id" not in {r["name"] for r in db.execute("PRAGMA table_info(faq)")}:
+        db.execute("ALTER TABLE faq ADD COLUMN parent_id INTEGER REFERENCES faq(id) ON DELETE CASCADE")
+        db.commit()
 
 
-def run(sql: str, *args) -> sqlite3.Cursor:
+ensure_schema()
+
+
+_dirty = {"at": 0.0}  # время последнего значимого изменения данных (для автокопии)
+
+
+def run(sql: str, *args, _quiet: bool = False) -> sqlite3.Cursor:
     cur = db.execute(sql, args)
     db.commit()
+    if not _quiet and "notifications" not in sql:
+        _dirty["at"] = time.time()
     return cur
 
 
@@ -257,6 +284,10 @@ async def show_panel(context, chat_id: int, uid: int, replace: Message | None = 
     rows = [
         [Btn("➕ Добавить проект", callback_data="prj_add")],
         [Btn("👥 Пользователи", callback_data="usr")],
+        [
+            Btn("💾 Резервная копия", callback_data="bk"),
+            Btn("♻️ Восстановить", callback_data="rs"),
+        ],
     ]
     if role == "admin":
         rows.append([Btn("🛡 Заместители", callback_data="dep")])
@@ -592,21 +623,224 @@ async def decide(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, a
         log.warning("Не удалось написать пользователю %s: %s", uid, e)
 
 
+# ───────────────────────── Резервные копии и восстановление ─────────────────────────
+
+
+def stamp() -> str:
+    return datetime.now(TZ).strftime("%Y%m%d-%H%M%S")
+
+
+def pretty(dt) -> str:
+    try:
+        return dt.astimezone(TZ).strftime("%d.%m.%Y %H:%M") if TZ else dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return "неизвестная дата"
+
+
+def db_is_empty() -> bool:
+    """Нет ни пользователей, ни проектов, ни ответственных, ни вопросов."""
+    return not any(
+        one(f"SELECT 1 FROM {t} LIMIT 1") for t in ("users", "projects", "members", "faq")
+    )
+
+
+def make_snapshot() -> bytes:
+    """Целостная копия базы (через sqlite backup API) в виде байтов."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "snapshot.db"
+        dst = sqlite3.connect(path)
+        try:
+            db.backup(dst)
+        finally:
+            dst.close()
+        return path.read_bytes()
+
+
+def validate_backup(path) -> str | None:
+    """None — файл годится; иначе текст ошибки."""
+    try:
+        con = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                return "Файл повреждён."
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return "Это не резервная копия бота: файл не открывается как база данных."
+    if not {"users", "projects"} <= tables:
+        return "В файле нет данных бота (нет таблиц users и projects)."
+    return None
+
+
+def backup_summary(path) -> str:
+    con = sqlite3.connect(path)
+    try:
+        def cnt(table: str) -> int:
+            try:
+                return con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            except sqlite3.Error:
+                return 0
+
+        return (
+            f"проектов — {cnt('projects')}, ответственных — {cnt('members')}, "
+            f"кнопок вопросов — {cnt('faq')}, пользователей — {cnt('users')}"
+        )
+    finally:
+        con.close()
+
+
+def restore_from(path) -> None:
+    """Полностью заменяет содержимое рабочей базы данными из файла."""
+    src = sqlite3.connect(path)
+    try:
+        src.backup(db)
+    finally:
+        src.close()
+    db.execute("PRAGMA foreign_keys = ON")
+    ensure_schema()  # копия могла быть сделана более старой версией бота
+
+
+async def send_backup(bot, chat_id: int, caption: str, pin: bool = False):
+    """Отправляет файл копии. pin=True — закрепляет его (предыдущую копию открепляет)."""
+    msg = await bot.send_document(
+        chat_id,
+        document=make_snapshot(),
+        filename=f"{BACKUP_PREFIX}{stamp()}.db",
+        caption=caption,
+        disable_notification=pin,
+    )
+    if pin:
+        key = f"backup_msg:{chat_id}"
+        old = one("SELECT value FROM settings WHERE key=?", key)
+        try:
+            await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+        except TelegramError as e:
+            log.warning("Не удалось закрепить копию у %s: %s", chat_id, e)
+        else:
+            if old and old["value"]:
+                try:
+                    await bot.unpin_chat_message(chat_id, int(old["value"]))
+                except (TelegramError, ValueError):
+                    pass
+            run(
+                "INSERT INTO settings(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                key, str(msg.message_id), _quiet=True,
+            )
+    return msg
+
+
+async def fetch_pinned_backup(bot):
+    """Ищет закреплённую копию в личных чатах админов. Возвращает (путь к файлу, дата) или None."""
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            chat = await bot.get_chat(admin_id)
+            pm = getattr(chat, "pinned_message", None)
+            doc = getattr(pm, "document", None) if pm else None
+            if not doc or not (doc.file_name or "").startswith(BACKUP_PREFIX):
+                continue
+            tg_file = await bot.get_file(doc.file_id)
+            path = Path(tempfile.mkdtemp()) / "pinned.db"
+            await tg_file.download_to_drive(path)
+            return path, pretty(pm.date)
+        except TelegramError as e:
+            log.warning("Закреплённая копия у %s недоступна: %s", admin_id, e)
+    return None
+
+
+async def backup_tick(bot) -> None:
+    """Если данные менялись и наступила тишина — шлёт автокопию админам."""
+    at = _dirty["at"]
+    if not at or time.time() - at < BACKUP_QUIET:
+        return
+    _dirty["at"] = 0.0
+    if db_is_empty():  # пустую базу не закрепляем, чтобы не затереть хорошую копию
+        return
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            await send_backup(bot, admin_id, f"💾 Автокопия базы · {stamp()}", pin=True)
+        except TelegramError as e:
+            log.warning("Автокопия не отправлена %s: %s", admin_id, e)
+
+
+async def backup_loop(bot) -> None:
+    while True:
+        await asyncio.sleep(15)
+        try:
+            await backup_tick(bot)
+        except Exception:
+            log.exception("Ошибка автокопии")
+
+
+async def restore_on_startup(bot) -> None:
+    """Пустая база (сброс на Render) -> пробуем восстановиться из закреплённой копии."""
+    if not db_is_empty():
+        return
+    found = await fetch_pinned_backup(bot)
+    if found and validate_backup(found[0]) is None:
+        restore_from(found[0])
+        text = (
+            "♻️ Данные на сервере были сброшены. База автоматически восстановлена "
+            f"из закреплённой копии от {found[1]}."
+        )
+        log.info("База восстановлена из закреплённой копии (%s)", found[1])
+    else:
+        text = (
+            "ℹ️ Бот запущен с пустой базой (первый запуск или сброс данных на сервере). "
+            "Закреплённой копии не найдено. Если есть файл копии: "
+            "⚙️ Управление → ♻️ Восстановить → 📎 Из файла."
+        )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except TelegramError:
+            pass
+
+
+async def show_restore(context, chat_id: int, uid: int, replace: Message | None = None):
+    context.user_data.pop("restore", None)
+    is_admin = get_role(uid) == "admin"
+    rows = [[Btn("⚡ Быстрое восстановление", callback_data="rs_fast")]]
+    if is_admin:
+        rows.append([Btn("📎 Из файла", callback_data="rs_file")])
+    rows.append([Btn("⬅️ Назад", callback_data="adm")])
+    text = (
+        "♻️ <b>Восстановление данных</b>\n\n"
+        "⚡ <b>Быстрое</b> — берёт последнюю автокопию, которую бот прислал администратору "
+        "и закрепил в его чате.\n"
+        + ("📎 <b>Из файла</b> — вы сами присылаете файл копии (.db).\n" if is_admin else "")
+        + "\nТекущие данные будут заменены."
+    )
+    await render(context, chat_id, text, Markup(rows), replace=replace)
+
+
+def restore_confirm_text(path, label: str) -> str:
+    return (
+        "♻️ <b>Восстановление данных</b>\n"
+        f"Источник: {esc(label)}\n"
+        f"В копии: {backup_summary(path)}\n\n"
+        "⚠️ Текущие данные будут заменены"
+        + (" (перед этим бот пришлёт вам копию текущих)." if not db_is_empty() else ".")
+    )
+
+
 # ───────────────────────── Обработчики ─────────────────────────
 
 MANAGER_CMDS = {
     "dec", "adm", "prj_add", "prj_name", "prj_desc", "prj_addm", "prj_delm",
     "prj_edm", "mem_pick", "mem_fld", "prj_docs",
     "faq_add", "faq_title", "fq_name", "fq_desc", "fq_url", "fq_del", "fq_del_yes",
+    "bk", "rs", "rs_fast", "rs_yes",
     "mdel", "prj_del", "prj_del_yes", "usr", "usr_del", "usr_del_yes",
 }
-ADMIN_CMDS = {"dep", "dep_t", "setimg"}
+ADMIN_CMDS = {"dep", "dep_t", "setimg", "rs_file"}
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("state", None)
     u = update.effective_user
-    run("UPDATE users SET username=?, full_name=? WHERE user_id=?", u.username, u.full_name, u.id)
+    run("UPDATE users SET username=?, full_name=? WHERE user_id=?", u.username, u.full_name, u.id, _quiet=True)
     await show_menu(context, update.effective_chat.id, u.id)
 
 
@@ -822,6 +1056,66 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         await show_users(context, chat_id, user.id, replace=msg)
 
+    # ── резервные копии и восстановление (админ и заместитель) ──
+    elif cmd == "bk":
+        await send_backup(context.bot, chat_id, f"💾 Резервная копия базы · {stamp()}")
+    elif cmd == "rs":
+        await show_restore(context, chat_id, user.id, replace=msg)
+    elif cmd == "rs_fast":
+        back = Markup([[Btn("⬅️ Назад", callback_data="rs")]])
+        found = await fetch_pinned_backup(context.bot)
+        if not found:
+            await render(
+                context, chat_id,
+                "Закреплённой автокопии не найдено. Администратор может восстановить "
+                "данные из файла («📎 Из файла»).",
+                back, replace=msg,
+            )
+        else:
+            path, when = found
+            err = validate_backup(path)
+            if err:
+                await render(context, chat_id, f"❌ {esc(err)}", back, replace=msg)
+            else:
+                label = f"автокопия от {when}"
+                context.user_data["restore"] = (str(path), "pinned", label)
+                await render(
+                    context, chat_id, restore_confirm_text(path, label),
+                    confirm_kb("rs_yes", "rs"), replace=msg,
+                )
+    elif cmd == "rs_file":  # только администратор
+        await ask(
+            context, chat_id, msg,
+            "Отправьте <b>файл резервной копии</b> (.db) как документ.",
+            ("restore_file",), cancel="rs",
+        )
+    elif cmd == "rs_yes":
+        info = context.user_data.pop("restore", None)
+        back = Markup([[Btn("⬅️ Назад", callback_data="rs")]])
+        if not info or not Path(info[0]).exists():
+            await render(context, chat_id, "Сессия устарела. Начните восстановление заново.", back, replace=msg)
+        else:
+            path, source, label = info
+            err = validate_backup(path)
+            if err:
+                await render(context, chat_id, f"❌ {esc(err)}", back, replace=msg)
+            else:
+                if not db_is_empty():  # страховка: копия текущих данных перед заменой
+                    try:
+                        await send_backup(
+                            context.bot, chat_id, f"🗂 Копия текущих данных перед восстановлением · {stamp()}"
+                        )
+                    except TelegramError as e:
+                        log.warning("Не удалось отправить страховочную копию: %s", e)
+                restore_from(path)
+                if source == "file":  # закреплённая копия должна совпасть с новым состоянием
+                    _dirty["at"] = time.time()
+                log.info("Данные восстановлены (%s) пользователем %s", label, user.id)
+                await render(
+                    context, chat_id, f"✅ Данные восстановлены ({esc(label)}).",
+                    Markup([[Btn("⚙️ Управление", callback_data="adm")]]), replace=msg,
+                )
+
     # ── только администратор ──
     elif cmd == "dep":
         await show_deputies(context, chat_id, replace=msg)
@@ -1035,6 +1329,30 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_menu(context, update.effective_chat.id, user.id)
 
 
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Файл копии от администратора для восстановления."""
+    user = update.effective_user
+    doc = update.message.document
+    if get_role(user.id) == "admin" and context.user_data.get("state") == ("restore_file",):
+        context.user_data.pop("state", None)
+        if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+            return await update.message.reply_text("Файл слишком большой (максимум 20 МБ).")
+        tg_file = await context.bot.get_file(doc.file_id)
+        path = Path(tempfile.mkdtemp()) / "upload.db"
+        await tg_file.download_to_drive(path)
+        err = validate_backup(path)
+        if err:
+            return await update.message.reply_text(f"❌ {err}")
+        label = f"файл {doc.file_name or 'без имени'}"
+        context.user_data["restore"] = (str(path), "file", label)
+        return await update.message.reply_text(
+            restore_confirm_text(path, label),
+            parse_mode=HTML,
+            reply_markup=confirm_kb("rs_yes", "rs"),
+        )
+    await show_menu(context, update.effective_chat.id, user.id)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Ошибка при обработке обновления", exc_info=context.error)
 
@@ -1083,6 +1401,17 @@ def start_keepalive():
     log.info("Keep-alive включён: %s каждые %s сек.", KEEPALIVE_URL, KEEPALIVE_INTERVAL)
 
 
+async def post_init(app: Application) -> None:
+    """Запускается один раз до начала опроса Telegram."""
+    try:
+        await restore_on_startup(app.bot)
+    except Exception:
+        log.exception("Автовосстановление не удалось")
+    if AUTO_BACKUP:
+        app.bot_data["backup_task"] = asyncio.create_task(backup_loop(app.bot))
+        log.info("Автокопии включены: после изменений данных копия уходит админам и закрепляется")
+
+
 def main():
     if not ADMIN_IDS:
         raise SystemExit("Задайте переменную окружения ADMIN_IDS (Telegram ID администратора).")
@@ -1090,11 +1419,12 @@ def main():
     start_keepalive()
 
     private = filters.ChatType.PRIVATE
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler(["start", "menu"], cmd_start, filters=private))
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO & private, on_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL & private, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & private, on_text))
     app.add_error_handler(on_error)
 
