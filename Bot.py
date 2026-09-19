@@ -16,7 +16,10 @@ import logging
 import os
 import re
 import sqlite3
+import textwrap
 import threading
+import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -49,6 +52,17 @@ ADMIN_IDS = {
 MENU_IMAGE = os.environ.get("MENU_IMAGE", "").strip()
 LOCAL_IMAGE = Path(__file__).with_name("menu.jpg")
 DB_PATH = os.environ.get("DB_PATH") or ("/data/bot.db" if Path("/data").is_dir() else "bot.db")
+
+# Keep-alive: бот сам обращается к своему публичному URL, чтобы бесплатный сервис
+# Render не засыпал (засыпает через 15 минут без входящих HTTP-запросов).
+# Render сам задаёт RENDER_EXTERNAL_URL; при желании можно указать свой KEEPALIVE_URL.
+KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
+KEEPALIVE_INTERVAL = 300  # секунд (5 минут)
+
+# Ширина колонок таблицы «Ответственные» в символах: Ответственный / Должность / Описание.
+# Длинный текст переносится на следующую строку. Сумма + 6 — около 50,
+# иначе таблица не поместится в сообщение на телефоне.
+TABLE_WIDTHS = (18, 12, 16)
 
 HTML = ParseMode.HTML
 esc = html.escape
@@ -83,10 +97,11 @@ db.executescript(
         description TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS members(
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        username   TEXT NOT NULL,
-        position   TEXT NOT NULL DEFAULT ''
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        username    TEXT NOT NULL,
+        position    TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS settings(
         key   TEXT PRIMARY KEY,
@@ -95,6 +110,11 @@ db.executescript(
     """
 )
 db.commit()
+
+# Миграция: колонка «Описание» для уже существующей базы (старые данные сохраняются)
+if "description" not in {r["name"] for r in db.execute("PRAGMA table_info(members)")}:
+    db.execute("ALTER TABLE members ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+    db.commit()
 
 
 def run(sql: str, *args) -> sqlite3.Cursor:
@@ -220,6 +240,34 @@ async def show_projects(context, chat_id: int, uid: int, replace: Message | None
     await render(context, chat_id, text, Markup(rows), replace=replace)
 
 
+def members_table(members) -> str:
+    """Таблица «Ответственный / Должность / Описание» в моноширинном блоке."""
+    headers = ("Ответственный", "Должность", "Описание")
+    data = [headers] + [
+        (f"@{m['username']}", m["position"] or "—", m["description"] or "—") for m in members
+    ]
+    widths = [min(max(len(row[i]) for row in data), TABLE_WIDTHS[i]) for i in range(3)]
+
+    def fmt_row(cells) -> list[str]:
+        wrapped = [textwrap.wrap(c, widths[i]) or [""] for i, c in enumerate(cells)]
+        height = max(len(w) for w in wrapped)
+        return [
+            " │ ".join(
+                (wrapped[i][k] if k < len(wrapped[i]) else "").ljust(widths[i])
+                for i in range(3)
+            ).rstrip()
+            for k in range(height)
+        ]
+
+    sep = "─┼─".join("─" * w for w in widths)
+    out = fmt_row(headers) + [sep]
+    for n, row in enumerate(data[1:]):
+        out += fmt_row(row)
+        if n < len(data) - 2:
+            out.append(sep)
+    return "\n".join(out)
+
+
 async def show_project(context, chat_id: int, uid: int, pid: int, replace: Message | None = None):
     p = one("SELECT * FROM projects WHERE id=?", pid)
     if not p:
@@ -229,10 +277,7 @@ async def show_project(context, chat_id: int, uid: int, pid: int, replace: Messa
     lines = [f"📁 <b>{esc(p['name'])}</b>", ""]
     lines.append(esc(p["description"]) if p["description"] else "<i>Описание пока не добавлено</i>")
     if members:
-        lines += ["", "👥 <b>Команда:</b>"]
-        for m in members:
-            pos = f" — {esc(m['position'])}" if m["position"] else ""
-            lines.append(f"• @{m['username']}{pos}")
+        lines += ["", "👥 <b>Ответственные:</b>", f"<pre>{esc(members_table(members))}</pre>"]
 
     # URL-кнопка открывает профиль/чат с пользователем
     rows = [
@@ -247,6 +292,7 @@ async def show_project(context, chat_id: int, uid: int, pid: int, replace: Messa
             ],
             [
                 Btn("➕ Участник", callback_data=f"prj_addm:{pid}"),
+                Btn("✏️ Участник", callback_data=f"prj_edm:{pid}"),
                 Btn("➖ Участник", callback_data=f"prj_delm:{pid}"),
             ],
             [Btn("🗑 Удалить проект", callback_data=f"prj_del:{pid}")],
@@ -429,6 +475,7 @@ async def decide(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, a
 
 MANAGER_CMDS = {
     "dec", "adm", "prj_add", "prj_name", "prj_desc", "prj_addm", "prj_delm",
+    "prj_edm", "mem_pick", "mem_fld",
     "mdel", "prj_del", "prj_del_yes", "usr", "usr_del", "usr_del_yes",
 }
 ADMIN_CMDS = {"dep", "dep_t", "setimg"}
@@ -485,14 +532,50 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask(context, chat_id, msg, "Введите <b>новое название</b> проекта:", ("edit_name", int(a[0])))
     elif cmd == "prj_desc":
         await ask(context, chat_id, msg, "Отправьте <b>новое описание</b> проекта:", ("edit_desc", int(a[0])))
+
+    # ── ответственные (таблица) ──
     elif cmd == "prj_addm":
         await ask(
             context, chat_id, msg,
-            "Отправьте @username (или ссылку t.me) и должность одним сообщением, например:\n"
-            "<code>@ivan_petrov Руководитель проекта</code>\n"
-            "<code>https://t.me/ivan_petrov Руководитель проекта</code>",
+            "Введите <b>Ответственного</b>: @username или ссылку t.me/username\n"
+            "Должность и описание бот спросит на следующих шагах.",
             ("add_member", int(a[0])),
         )
+    elif cmd == "prj_edm":
+        pid = int(a[0])
+        members = many("SELECT * FROM members WHERE project_id=? ORDER BY id", pid)
+        rows = [[Btn(f"✏️ @{m['username']}", callback_data=f"mem_pick:{m['id']}:{pid}")] for m in members]
+        rows.append([Btn("⬅️ Назад", callback_data=f"prj:{pid}")])
+        await render(
+            context, chat_id,
+            "Чьи данные изменить?" if members else "В проекте пока нет ответственных.",
+            Markup(rows), replace=msg,
+        )
+    elif cmd == "mem_pick":
+        mid, pid = int(a[0]), int(a[1])
+        m = one("SELECT * FROM members WHERE id=?", mid)
+        if not m:
+            return await show_project(context, chat_id, user.id, pid, replace=msg)
+        rows = [
+            [Btn("👤 Ответственный", callback_data=f"mem_fld:{mid}:{pid}:username")],
+            [Btn("💼 Должность", callback_data=f"mem_fld:{mid}:{pid}:position")],
+            [Btn("📝 Описание", callback_data=f"mem_fld:{mid}:{pid}:description")],
+            [Btn("⬅️ Назад", callback_data=f"prj_edm:{pid}")],
+        ]
+        await render(
+            context, chat_id, f"Что изменить у <b>@{esc(m['username'])}</b>?",
+            Markup(rows), replace=msg,
+        )
+    elif cmd == "mem_fld":
+        mid, pid, field = int(a[0]), int(a[1]), a[2]
+        prompts = {
+            "username": "Введите нового <b>Ответственного</b>: @username или ссылку t.me/username",
+            "position": "Введите новую <b>должность</b> (или «-», чтобы очистить):",
+            "description": "Введите новое <b>описание</b> (или «-», чтобы очистить):",
+        }
+        if field not in prompts:
+            return await show_project(context, chat_id, user.id, pid, replace=msg)
+        await ask(context, chat_id, msg, prompts[field], ("edit_member", mid, pid, field))
     elif cmd == "prj_delm":
         pid = int(a[0])
         members = many("SELECT * FROM members WHERE project_id=? ORDER BY id", pid)
@@ -592,26 +675,67 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("state", None)
         return await show_project(context, chat_id, user.id, cur.lastrowid)
 
+    # ── добавление ответственного: три шага, каждый столбец отдельно ──
+    if kind == "add_member":  # шаг 1: Ответственный
+        parts = text.split()
+        username = extract_username(parts[0]) if len(parts) == 1 else None
+        if not username:
+            return await update.message.reply_text(
+                "Пришлите только @username (или ссылку t.me/username) — "
+                "должность и описание бот спросит дальше."
+            )
+        context.user_data["state"] = ("add_member_pos", state[1], username)
+        await update.message.reply_text(
+            "Теперь отправьте <b>должность</b> (или «-», чтобы оставить пустой):",
+            parse_mode=HTML,
+        )
+        return
+
+    if kind == "add_member_pos":  # шаг 2: Должность
+        position = "" if text == "-" else text[:100]
+        context.user_data["state"] = ("add_member_desc", state[1], state[2], position)
+        await update.message.reply_text(
+            "Теперь отправьте <b>описание</b> (или «-», чтобы оставить пустым):",
+            parse_mode=HTML,
+        )
+        return
+
+    if kind == "add_member_desc":  # шаг 3: Описание
+        if len(text) > 200:
+            return await update.message.reply_text("Слишком длинное описание (максимум 200 символов).")
+        run(
+            "INSERT INTO members(project_id, username, position, description) VALUES(?,?,?,?)",
+            state[1], state[2], state[3], "" if text == "-" else text,
+        )
+        context.user_data.pop("state", None)
+        return await show_project(context, chat_id, user.id, state[1])
+
+    # ── изменение одного столбца ответственного ──
+    if kind == "edit_member":
+        _, mid, pid, field = state
+        if field == "username":
+            parts = text.split()
+            username = extract_username(parts[0]) if len(parts) == 1 else None
+            if not username:
+                return await update.message.reply_text(
+                    "Не похоже на username. Пришлите @username или ссылку t.me/username."
+                )
+            run("UPDATE members SET username=? WHERE id=?", username, mid)
+        elif field == "position":
+            run("UPDATE members SET position=? WHERE id=?", "" if text == "-" else text[:100], mid)
+        elif field == "description":
+            if len(text) > 200:
+                return await update.message.reply_text("Слишком длинное описание (максимум 200 символов).")
+            run("UPDATE members SET description=? WHERE id=?", "" if text == "-" else text, mid)
+        context.user_data.pop("state", None)
+        return await show_project(context, chat_id, user.id, pid)
+
     if kind == "edit_name":
         if len(text) > 100:
             return await update.message.reply_text("Слишком длинное название (максимум 100 символов).")
         run("UPDATE projects SET name=? WHERE id=?", text, state[1])
     elif kind == "edit_desc":
         run("UPDATE projects SET description=? WHERE id=?", "" if text == "-" else text, state[1])
-    elif kind == "add_member":
-        parts = text.split(None, 1)
-        username = extract_username(parts[0]) if parts else None
-        if not username:
-            return await update.message.reply_text(
-                "Не похоже на username. Формат: <code>@username Должность</code>\n"
-                "Можно также прислать ссылку: <code>https://t.me/username Должность</code>",
-                parse_mode=HTML,
-            )
-        position = parts[1].strip()[:100] if len(parts) > 1 else ""
-        run(
-            "INSERT INTO members(project_id, username, position) VALUES(?,?,?)",
-            state[1], username, position,
-        )
     else:
         return await show_menu(context, chat_id, user.id)
 
@@ -652,6 +776,10 @@ def start_health_server():
             self.end_headers()
             self.wfile.write(b"ok")
 
+        def do_HEAD(self):  # UptimeRobot и подобные пингеры по умолчанию шлют HEAD
+            self.send_response(200)
+            self.end_headers()
+
         def log_message(self, *args):
             pass
 
@@ -659,10 +787,29 @@ def start_health_server():
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
+def start_keepalive():
+    """Раз в KEEPALIVE_INTERVAL секунд обращается к собственному публичному URL."""
+    if not KEEPALIVE_URL or not os.environ.get("PORT"):
+        return
+
+    def loop():
+        while True:
+            time.sleep(KEEPALIVE_INTERVAL)  # сначала ждём: сервер уже должен быть поднят
+            try:
+                with urllib.request.urlopen(KEEPALIVE_URL, timeout=20) as resp:
+                    resp.read()
+            except Exception as e:  # сеть моргнула — просто попробуем в следующий раз
+                log.warning("Keep-alive не удался: %s", e)
+
+    threading.Thread(target=loop, daemon=True, name="keepalive").start()
+    log.info("Keep-alive включён: %s каждые %s сек.", KEEPALIVE_URL, KEEPALIVE_INTERVAL)
+
+
 def main():
     if not ADMIN_IDS:
         raise SystemExit("Задайте переменную окружения ADMIN_IDS (Telegram ID администратора).")
     start_health_server()
+    start_keepalive()
 
     private = filters.ChatType.PRIVATE
     app = Application.builder().token(BOT_TOKEN).build()
