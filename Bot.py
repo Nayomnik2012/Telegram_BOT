@@ -1,11 +1,13 @@
 """
-Telegram-бот: белый список, заявки на доступ, проекты и команда проекта.1
+Telegram-бот: белый список, заявки на доступ, проекты и команда проекта.
 
 Переменные окружения (Render -> Environment):
     BOT_TOKEN   - токен от @BotFather                       (обязательно)
     ADMIN_IDS   - Telegram ID администратора(ов) через запятую (обязательно)
     MENU_IMAGE  - URL картинки для меню                      (необязательно)
     DB_PATH     - путь к файлу базы, например /data/bot.db    (необязательно)
+    DOCS_URL    - ссылка на Confluence для кнопки «Документация по проектам»
+                  по умолчанию (у проекта можно задать свою)     (необязательно)
 
 Картинку меню можно также задать прямо в боте: Управление -> Картинка меню,
 либо положить файл menu.jpg рядом с bot.py.
@@ -59,6 +61,11 @@ DB_PATH = os.environ.get("DB_PATH") or ("/data/bot.db" if Path("/data").is_dir()
 KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
 KEEPALIVE_INTERVAL = 300  # секунд (5 минут)
 
+# Общая ссылка на документацию (Confluence). У каждого проекта можно задать свою
+# прямо в боте (кнопка «Ссылка на документацию»), тогда будет использоваться она.
+DOCS_URL = os.environ.get("DOCS_URL", "").strip()
+URL_RE = re.compile(r"https?://\S+")
+
 # Ширина колонок таблицы «Ответственные» в символах: Ответственный / Должность / Описание.
 # Длинный текст переносится на следующую строку. Сумма + 6 — около 50,
 # иначе таблица не поместится в сообщение на телефоне.
@@ -94,7 +101,8 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS projects(
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         name        TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT ''
+        description TEXT NOT NULL DEFAULT '',
+        docs_url    TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS members(
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +122,11 @@ db.commit()
 # Миграция: колонка «Описание» для уже существующей базы (старые данные сохраняются)
 if "description" not in {r["name"] for r in db.execute("PRAGMA table_info(members)")}:
     db.execute("ALTER TABLE members ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+    db.commit()
+
+# Миграция: ссылка на документацию у проекта
+if "docs_url" not in {r["name"] for r in db.execute("PRAGMA table_info(projects)")}:
+    db.execute("ALTER TABLE projects ADD COLUMN docs_url TEXT NOT NULL DEFAULT ''")
     db.commit()
 
 
@@ -279,11 +292,11 @@ async def show_project(context, chat_id: int, uid: int, pid: int, replace: Messa
     if members:
         lines += ["", "👥 <b>Ответственные QA на проектах:</b>", f"<pre>{esc(members_table(members))}</pre>"]
 
-    # URL-кнопка открывает профиль/чат с пользователем
-    rows = [
-        [Btn(f"💬 Написать @{m['username']}", url=f"https://t.me/{m['username']}")]
-        for m in members
-    ]
+    # Кнопка со ссылкой на Confluence (своя у проекта или общая DOCS_URL)
+    rows = []
+    docs = p["docs_url"] or DOCS_URL
+    if docs:
+        rows.append([Btn("📚 Документация по проектам", url=docs)])
     if get_role(uid) in MANAGERS:
         rows += [
             [
@@ -295,6 +308,7 @@ async def show_project(context, chat_id: int, uid: int, pid: int, replace: Messa
                 Btn("✏️ Участник", callback_data=f"prj_edm:{pid}"),
                 Btn("➖ Участник", callback_data=f"prj_delm:{pid}"),
             ],
+            [Btn("📚 Ссылка на документацию", callback_data=f"prj_docs:{pid}")],
             [Btn("🗑 Удалить проект", callback_data=f"prj_del:{pid}")],
         ]
     rows.append([Btn("⬅️ Проекты", callback_data="prj:list"), Btn("🏠 Меню", callback_data="menu")])
@@ -475,7 +489,7 @@ async def decide(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, a
 
 MANAGER_CMDS = {
     "dec", "adm", "prj_add", "prj_name", "prj_desc", "prj_addm", "prj_delm",
-    "prj_edm", "mem_pick", "mem_fld",
+    "prj_edm", "mem_pick", "mem_fld", "prj_docs",
     "mdel", "prj_del", "prj_del_yes", "usr", "usr_del", "usr_del_yes",
 }
 ADMIN_CMDS = {"dep", "dep_t", "setimg"}
@@ -532,6 +546,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask(context, chat_id, msg, "Введите <b>новое название</b> проекта:", ("edit_name", int(a[0])))
     elif cmd == "prj_desc":
         await ask(context, chat_id, msg, "Отправьте <b>новое описание</b> проекта:", ("edit_desc", int(a[0])))
+
+    elif cmd == "prj_docs":
+        await ask(
+            context, chat_id, msg,
+            "Отправьте <b>ссылку на документацию</b> проекта в Confluence (https://...)\n"
+            "или «-», чтобы убрать свою ссылку (тогда будет общая, если она задана).",
+            ("edit_docs", int(a[0])),
+        )
 
     # ── ответственные (таблица) ──
     elif cmd == "prj_addm":
@@ -674,6 +696,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = run("INSERT INTO projects(name, description) VALUES(?,?)", state[1], desc)
         context.user_data.pop("state", None)
         return await show_project(context, chat_id, user.id, cur.lastrowid)
+
+    if kind == "edit_docs":
+        if text == "-":
+            url = ""
+        elif URL_RE.fullmatch(text) and len(text) <= 500:
+            url = text
+        else:
+            return await update.message.reply_text(
+                "Не похоже на ссылку. Она должна начинаться с https:// (или «-», чтобы убрать)."
+            )
+        run("UPDATE projects SET docs_url=? WHERE id=?", url, state[1])
+        context.user_data.pop("state", None)
+        return await show_project(context, chat_id, user.id, state[1])
 
     # ── добавление ответственного: три шага, каждый столбец отдельно ──
     if kind == "add_member":  # шаг 1: Ответственный
