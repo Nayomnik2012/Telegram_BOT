@@ -277,7 +277,7 @@ async def show_project(context, chat_id: int, uid: int, pid: int, replace: Messa
     lines = [f"📁 <b>{esc(p['name'])}</b>", ""]
     lines.append(esc(p["description"]) if p["description"] else "<i>Описание пока не добавлено</i>")
     if members:
-        lines += ["", "👥 <b>Ответственные:</b>", f"<pre>{esc(members_table(members))}</pre>"]
+        lines += ["", "👥 <b>Ответственные QA на проектах:</b>", f"<pre>{esc(members_table(members))}</pre>"]
 
     # URL-кнопка открывает профиль/чат с пользователем
     rows = [
