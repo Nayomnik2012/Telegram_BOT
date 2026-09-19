@@ -66,6 +66,9 @@ KEEPALIVE_INTERVAL = 300  # секунд (5 минут)
 DOCS_URL = os.environ.get("DOCS_URL", "").strip()
 URL_RE = re.compile(r"https?://\S+")
 
+# Название кнопки «Часто задаваемые вопросы» по умолчанию (админ/зам меняет его в боте)
+FAQ_DEFAULT_TITLE = "Часто задаваемые вопросы по проектам"
+
 # Ширина колонок таблицы «Ответственные» в символах: Ответственный / Должность / Описание.
 # Длинный текст переносится на следующую строку. Сумма + 6 — около 50,
 # иначе таблица не поместится в сообщение на телефоне.
@@ -102,7 +105,8 @@ db.executescript(
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         name        TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
-        docs_url    TEXT NOT NULL DEFAULT ''
+        docs_url    TEXT NOT NULL DEFAULT '',
+        faq_title   TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS members(
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +114,13 @@ db.executescript(
         username    TEXT NOT NULL,
         position    TEXT NOT NULL DEFAULT '',
         description TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS faq(
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title       TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        docs_url    TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS settings(
         key   TEXT PRIMARY KEY,
@@ -127,6 +138,11 @@ if "description" not in {r["name"] for r in db.execute("PRAGMA table_info(member
 # Миграция: ссылка на документацию у проекта
 if "docs_url" not in {r["name"] for r in db.execute("PRAGMA table_info(projects)")}:
     db.execute("ALTER TABLE projects ADD COLUMN docs_url TEXT NOT NULL DEFAULT ''")
+    db.commit()
+
+# Миграция: название кнопки «Часто задаваемые вопросы» у проекта
+if "faq_title" not in {r["name"] for r in db.execute("PRAGMA table_info(projects)")}:
+    db.execute("ALTER TABLE projects ADD COLUMN faq_title TEXT NOT NULL DEFAULT ''")
     db.commit()
 
 
@@ -297,6 +313,7 @@ async def show_project(context, chat_id: int, uid: int, pid: int, replace: Messa
     docs = p["docs_url"] or DOCS_URL
     if docs:
         rows.append([Btn("📚 Документация по проектам", url=docs)])
+    rows.append([Btn(f"❓ {faq_title_of(p)}"[:64], callback_data=f"faq:{pid}")])
     if get_role(uid) in MANAGERS:
         rows += [
             [
@@ -313,6 +330,81 @@ async def show_project(context, chat_id: int, uid: int, pid: int, replace: Messa
         ]
     rows.append([Btn("⬅️ Проекты", callback_data="prj:list"), Btn("🏠 Меню", callback_data="menu")])
     await render(context, chat_id, "\n".join(lines), Markup(rows), replace=replace)
+
+
+def faq_title_of(p) -> str:
+    return p["faq_title"] or FAQ_DEFAULT_TITLE
+
+
+def parse_url(text: str) -> str | None:
+    """«-» -> "" (убрать ссылку); корректная http(s)-ссылка -> она же; иначе None."""
+    if text == "-":
+        return ""
+    return text if URL_RE.fullmatch(text) and len(text) <= 500 else None
+
+
+def nav_rows(pid: int, back: str) -> list:
+    """Кнопки навигации внизу каждого экрана раздела вопросов."""
+    return [
+        [Btn("⬅️ Вернуться назад", callback_data=back)],
+        [Btn("🏠 Вернуться в главное меню проекта", callback_data=f"prj:{pid}")],
+        [Btn("📁 Все проекты", callback_data="prj:list")],
+    ]
+
+
+async def show_faq(context, chat_id: int, uid: int, pid: int, replace: Message | None = None):
+    """Список кнопок-вопросов проекта."""
+    p = one("SELECT * FROM projects WHERE id=?", pid)
+    if not p:
+        return await show_projects(context, chat_id, uid, replace)
+    items = many("SELECT id, title FROM faq WHERE project_id=? ORDER BY id", pid)
+    is_mgr = get_role(uid) in MANAGERS
+
+    rows = [[Btn(f"❓ {i['title']}"[:60], callback_data=f"fq:{i['id']}")] for i in items]
+    if is_mgr:
+        rows.append(
+            [
+                Btn("➕ Добавить кнопку", callback_data=f"faq_add:{pid}"),
+                Btn("✏️ Название раздела", callback_data=f"faq_title:{pid}"),
+            ]
+        )
+    rows += nav_rows(pid, f"prj:{pid}")
+
+    text = f"❓ <b>{esc(faq_title_of(p))}</b>\n📁 {esc(p['name'])}"
+    if not items:
+        text += "\n\nПока нет ни одного вопроса."
+        if is_mgr:
+            text += "\nНажмите «➕ Добавить кнопку»."
+    await render(context, chat_id, text, Markup(rows), replace=replace)
+
+
+async def show_faq_item(context, chat_id: int, uid: int, fid: int, replace: Message | None = None):
+    """Описание выбранного вопроса + ссылка на документацию + навигация."""
+    f = one("SELECT * FROM faq WHERE id=?", fid)
+    if not f:
+        return await show_projects(context, chat_id, uid, replace)
+    pid = f["project_id"]
+    p = one("SELECT docs_url FROM projects WHERE id=?", pid)
+
+    text = f"<b>{esc(f['title'])}</b>\n\n" + (
+        esc(f["description"]) if f["description"] else "<i>Описание пока не добавлено</i>"
+    )
+
+    rows = []
+    url = f["docs_url"] or (p["docs_url"] if p else "") or DOCS_URL  # своя -> проекта -> общая
+    if url:
+        rows.append([Btn("📚 Документация", url=url)])
+    if get_role(uid) in MANAGERS:
+        rows += [
+            [
+                Btn("✏️ Название", callback_data=f"fq_name:{fid}"),
+                Btn("✏️ Описание", callback_data=f"fq_desc:{fid}"),
+            ],
+            [Btn("📚 Ссылка на документацию", callback_data=f"fq_url:{fid}")],
+            [Btn("🗑 Удалить кнопку", callback_data=f"fq_del:{fid}")],
+        ]
+    rows += nav_rows(pid, f"faq:{pid}")
+    await render(context, chat_id, text, Markup(rows), replace=replace)
 
 
 async def show_users(context, chat_id: int, uid: int, replace: Message | None = None):
@@ -359,10 +451,10 @@ def confirm_kb(yes: str, no: str) -> Markup:
     return Markup([[Btn("✅ Да", callback_data=yes), Btn("✖️ Нет", callback_data=no)]])
 
 
-async def ask(context, chat_id: int, msg: Message, text: str, state: tuple):
+async def ask(context, chat_id: int, msg: Message, text: str, state: tuple, cancel: str = "menu"):
     """Просит админа/зама прислать текст и запоминает, что именно ждём."""
     context.user_data["state"] = state
-    kb = Markup([[Btn("✖️ Отмена", callback_data="menu")]])
+    kb = Markup([[Btn("✖️ Отмена", callback_data=cancel)]])
     await render(context, chat_id, text, kb, replace=msg)
 
 
@@ -490,6 +582,7 @@ async def decide(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, a
 MANAGER_CMDS = {
     "dec", "adm", "prj_add", "prj_name", "prj_desc", "prj_addm", "prj_delm",
     "prj_edm", "mem_pick", "mem_fld", "prj_docs",
+    "faq_add", "faq_title", "fq_name", "fq_desc", "fq_url", "fq_del", "fq_del_yes",
     "mdel", "prj_del", "prj_del_yes", "usr", "usr_del", "usr_del_yes",
 }
 ADMIN_CMDS = {"dep", "dep_t", "setimg"}
@@ -554,6 +647,55 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "или «-», чтобы убрать свою ссылку (тогда будет общая, если она задана).",
             ("edit_docs", int(a[0])),
         )
+
+    # ── часто задаваемые вопросы ──
+    elif cmd == "faq":
+        await show_faq(context, chat_id, user.id, int(a[0]), replace=msg)
+    elif cmd == "fq":
+        await show_faq_item(context, chat_id, user.id, int(a[0]), replace=msg)
+    elif cmd == "faq_add":
+        await ask(
+            context, chat_id, msg, "Введите <b>название новой кнопки</b> (до 60 символов):",
+            ("faq_add_title", int(a[0])), cancel=f"faq:{a[0]}",
+        )
+    elif cmd == "faq_title":
+        await ask(
+            context, chat_id, msg,
+            "Введите новое <b>название раздела</b> (кнопки в карточке проекта)\n"
+            "или «-», чтобы вернуть стандартное.",
+            ("faq_title", int(a[0])), cancel=f"faq:{a[0]}",
+        )
+    elif cmd == "fq_name":
+        await ask(
+            context, chat_id, msg, "Введите новое <b>название кнопки</b>:",
+            ("faq_edit", int(a[0]), "title"), cancel=f"fq:{a[0]}",
+        )
+    elif cmd == "fq_desc":
+        await ask(
+            context, chat_id, msg, "Отправьте новое <b>описание</b> (или «-», чтобы очистить):",
+            ("faq_edit", int(a[0]), "description"), cancel=f"fq:{a[0]}",
+        )
+    elif cmd == "fq_url":
+        await ask(
+            context, chat_id, msg,
+            "Отправьте <b>ссылку на документацию</b> (Confluence, https://...)\n"
+            "или «-», чтобы убрать (тогда будет ссылка проекта, если она задана).",
+            ("faq_edit", int(a[0]), "docs_url"), cancel=f"fq:{a[0]}",
+        )
+    elif cmd == "fq_del":
+        f = one("SELECT title FROM faq WHERE id=?", int(a[0]))
+        await render(
+            context, chat_id,
+            f"Удалить кнопку <b>{esc(f['title']) if f else ''}</b>?",
+            confirm_kb(f"fq_del_yes:{a[0]}", f"fq:{a[0]}"), replace=msg,
+        )
+    elif cmd == "fq_del_yes":
+        f = one("SELECT project_id FROM faq WHERE id=?", int(a[0]))
+        run("DELETE FROM faq WHERE id=?", int(a[0]))
+        if f:
+            await show_faq(context, chat_id, user.id, f["project_id"], replace=msg)
+        else:
+            await show_projects(context, chat_id, user.id, replace=msg)
 
     # ── ответственные (таблица) ──
     elif cmd == "prj_addm":
@@ -620,6 +762,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif cmd == "prj_del_yes":
         run("DELETE FROM members WHERE project_id=?", int(a[0]))
+        run("DELETE FROM faq WHERE project_id=?", int(a[0]))
         run("DELETE FROM projects WHERE id=?", int(a[0]))
         await show_projects(context, chat_id, user.id, replace=msg)
 
@@ -709,6 +852,67 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         run("UPDATE projects SET docs_url=? WHERE id=?", url, state[1])
         context.user_data.pop("state", None)
         return await show_project(context, chat_id, user.id, state[1])
+
+    # ── часто задаваемые вопросы ──
+    if kind == "faq_title":
+        if len(text) > 60:
+            return await update.message.reply_text("Слишком длинное название (максимум 60 символов).")
+        run("UPDATE projects SET faq_title=? WHERE id=?", "" if text == "-" else text, state[1])
+        context.user_data.pop("state", None)
+        return await show_faq(context, chat_id, user.id, state[1])
+
+    if kind == "faq_add_title":  # шаг 1: название кнопки
+        if len(text) > 60:
+            return await update.message.reply_text("Слишком длинное название (максимум 60 символов).")
+        context.user_data["state"] = ("faq_add_desc", state[1], text)
+        await update.message.reply_text(
+            "Теперь отправьте <b>описание</b> (или «-», чтобы оставить пустым):", parse_mode=HTML
+        )
+        return
+
+    if kind == "faq_add_desc":  # шаг 2: описание
+        if len(text) > 3000:
+            return await update.message.reply_text("Слишком длинное описание (максимум 3000 символов).")
+        context.user_data["state"] = ("faq_add_url", state[1], state[2], "" if text == "-" else text)
+        await update.message.reply_text(
+            "Теперь отправьте <b>ссылку на документацию</b> (https://...) "
+            "или «-», чтобы пропустить:",
+            parse_mode=HTML,
+        )
+        return
+
+    if kind == "faq_add_url":  # шаг 3: ссылка
+        url = parse_url(text)
+        if url is None:
+            return await update.message.reply_text(
+                "Не похоже на ссылку. Она должна начинаться с https:// (или «-», чтобы пропустить)."
+            )
+        run(
+            "INSERT INTO faq(project_id, title, description, docs_url) VALUES(?,?,?,?)",
+            state[1], state[2], state[3], url,
+        )
+        context.user_data.pop("state", None)
+        return await show_faq(context, chat_id, user.id, state[1])
+
+    if kind == "faq_edit":  # изменение одного поля существующей кнопки
+        _, fid, field = state
+        if field == "title":
+            if len(text) > 60:
+                return await update.message.reply_text("Слишком длинное название (максимум 60 символов).")
+            run("UPDATE faq SET title=? WHERE id=?", text, fid)
+        elif field == "description":
+            if len(text) > 3000:
+                return await update.message.reply_text("Слишком длинное описание (максимум 3000 символов).")
+            run("UPDATE faq SET description=? WHERE id=?", "" if text == "-" else text, fid)
+        elif field == "docs_url":
+            url = parse_url(text)
+            if url is None:
+                return await update.message.reply_text(
+                    "Не похоже на ссылку. Она должна начинаться с https:// (или «-», чтобы убрать)."
+                )
+            run("UPDATE faq SET docs_url=? WHERE id=?", url, fid)
+        context.user_data.pop("state", None)
+        return await show_faq_item(context, chat_id, user.id, fid)
 
     # ── добавление ответственного: три шага, каждый столбец отдельно ──
     if kind == "add_member":  # шаг 1: Ответственный
