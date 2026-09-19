@@ -38,6 +38,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -409,6 +410,21 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =============================================================================
+# ОБРАБОТКА ОШИБОК
+# =============================================================================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, Conflict):
+        # Бот сам продолжит опрос, когда второй экземпляр остановится
+        log.warning(
+            "Conflict: с этим токеном уже работает другой экземпляр бота "
+            "(старый деплой, другой сервис или запуск на ПК)"
+        )
+        return
+    log.error("Необработанная ошибка", exc_info=err)
+
+
+# =============================================================================
 # HEALTH-СЕРВЕР ДЛЯ RENDER
 # =============================================================================
 class _Health(BaseHTTPRequestHandler):
@@ -487,6 +503,7 @@ def main() -> None:
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
     app.add_handler(InlineQueryHandler(on_inline))
+    app.add_error_handler(on_error)
 
     log.info("Бот запущен. БД: %s. Админы: %s", DB_PATH, sorted(ADMIN_IDS))
     app.run_polling(
