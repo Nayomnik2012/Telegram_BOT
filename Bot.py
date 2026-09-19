@@ -120,7 +120,8 @@ db.executescript(
         project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
         title       TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
-        docs_url    TEXT NOT NULL DEFAULT ''
+        docs_url    TEXT NOT NULL DEFAULT '',
+        parent_id   INTEGER REFERENCES faq(id) ON DELETE CASCADE   -- NULL = верхний уровень
     );
     CREATE TABLE IF NOT EXISTS settings(
         key   TEXT PRIMARY KEY,
@@ -143,6 +144,11 @@ if "docs_url" not in {r["name"] for r in db.execute("PRAGMA table_info(projects)
 # Миграция: название кнопки «Часто задаваемые вопросы» у проекта
 if "faq_title" not in {r["name"] for r in db.execute("PRAGMA table_info(projects)")}:
     db.execute("ALTER TABLE projects ADD COLUMN faq_title TEXT NOT NULL DEFAULT ''")
+    db.commit()
+
+# Миграция: вложенные кнопки (директории) внутри «Часто задаваемых вопросов»
+if "parent_id" not in {r["name"] for r in db.execute("PRAGMA table_info(faq)")}:
+    db.execute("ALTER TABLE faq ADD COLUMN parent_id INTEGER REFERENCES faq(id) ON DELETE CASCADE")
     db.commit()
 
 
@@ -357,14 +363,16 @@ async def show_faq(context, chat_id: int, uid: int, pid: int, replace: Message |
     p = one("SELECT * FROM projects WHERE id=?", pid)
     if not p:
         return await show_projects(context, chat_id, uid, replace)
-    items = many("SELECT id, title FROM faq WHERE project_id=? ORDER BY id", pid)
+    items = many(
+        "SELECT id, title FROM faq WHERE project_id=? AND parent_id IS NULL ORDER BY id", pid
+    )
     is_mgr = get_role(uid) in MANAGERS
 
     rows = [[Btn(f"ℹ️ {i['title']}"[:60], callback_data=f"fq:{i['id']}")] for i in items]
     if is_mgr:
         rows.append(
             [
-                Btn("➕ Добавить кнопку", callback_data=f"faq_add:{pid}"),
+                Btn("➕ Добавить кнопку", callback_data=f"faq_add:{pid}:0"),
                 Btn("✏️ Название раздела", callback_data=f"faq_title:{pid}"),
             ]
         )
@@ -379,18 +387,23 @@ async def show_faq(context, chat_id: int, uid: int, pid: int, replace: Message |
 
 
 async def show_faq_item(context, chat_id: int, uid: int, fid: int, replace: Message | None = None):
-    """Описание выбранного вопроса + ссылка на документацию + навигация."""
+    """Страница кнопки: описание, вложенные кнопки, ссылка на документацию, навигация."""
     f = one("SELECT * FROM faq WHERE id=?", fid)
     if not f:
         return await show_projects(context, chat_id, uid, replace)
     pid = f["project_id"]
     p = one("SELECT docs_url FROM projects WHERE id=?", pid)
+    children = many("SELECT id, title FROM faq WHERE parent_id=? ORDER BY id", fid)
 
-    text = f"<b>{esc(f['title'])}</b>\n\n" + (
-        esc(f["description"]) if f["description"] else "<i>Описание пока не добавлено</i>"
-    )
+    if f["description"]:
+        body = esc(f["description"])
+    elif children:
+        body = "<i>Выберите раздел ниже</i>"
+    else:
+        body = "<i>Описание пока не добавлено</i>"
+    text = f"<b>{esc(f['title'])}</b>\n\n{body}"
 
-    rows = []
+    rows = [[Btn(f"ℹ️ {c['title']}"[:60], callback_data=f"fq:{c['id']}")] for c in children]
     url = f["docs_url"] or (p["docs_url"] if p else "") or DOCS_URL  # своя -> проекта -> общая
     if url:
         rows.append([Btn("📚 Документация", url=url)])
@@ -401,9 +414,11 @@ async def show_faq_item(context, chat_id: int, uid: int, fid: int, replace: Mess
                 Btn("✏️ Описание", callback_data=f"fq_desc:{fid}"),
             ],
             [Btn("📚 Ссылка на документацию", callback_data=f"fq_url:{fid}")],
+            [Btn("➕ Добавить кнопку внутри", callback_data=f"faq_add:{pid}:{fid}")],
             [Btn("🗑 Удалить кнопку", callback_data=f"fq_del:{fid}")],
         ]
-    rows += nav_rows(pid, f"faq:{pid}")
+    back = f"fq:{f['parent_id']}" if f["parent_id"] else f"faq:{pid}"  # на шаг назад
+    rows += nav_rows(pid, back)
     await render(context, chat_id, text, Markup(rows), replace=replace)
 
 
@@ -654,9 +669,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif cmd == "fq":
         await show_faq_item(context, chat_id, user.id, int(a[0]), replace=msg)
     elif cmd == "faq_add":
+        pid = int(a[0])
+        parent = int(a[1]) if len(a) > 1 else 0  # 0 = верхний уровень
+        where = ""
+        if parent:
+            par = one("SELECT title FROM faq WHERE id=?", parent)
+            if par:
+                where = f" внутри «{esc(par['title'])}»"
         await ask(
-            context, chat_id, msg, "Введите <b>название новой кнопки</b> (до 60 символов):",
-            ("faq_add_title", int(a[0])), cancel=f"faq:{a[0]}",
+            context, chat_id, msg,
+            f"Введите <b>название новой кнопки</b>{where} (до 60 символов):",
+            ("faq_add_title", pid, parent),
+            cancel=f"fq:{parent}" if parent else f"faq:{pid}",
         )
     elif cmd == "faq_title":
         await ask(
@@ -683,16 +707,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("faq_edit", int(a[0]), "docs_url"), cancel=f"fq:{a[0]}",
         )
     elif cmd == "fq_del":
-        f = one("SELECT title FROM faq WHERE id=?", int(a[0]))
+        fid = int(a[0])
+        f = one("SELECT title FROM faq WHERE id=?", fid)
+        nested = one(
+            "WITH RECURSIVE d(id) AS (SELECT id FROM faq WHERE parent_id=? "
+            "UNION ALL SELECT x.id FROM faq x JOIN d ON x.parent_id=d.id) "
+            "SELECT COUNT(*) AS n FROM d",
+            fid,
+        )["n"]
+        warn = f"\nВместе с ней удалятся вложенные кнопки: {nested}." if nested else ""
         await render(
             context, chat_id,
-            f"Удалить кнопку <b>{esc(f['title']) if f else ''}</b>?",
-            confirm_kb(f"fq_del_yes:{a[0]}", f"fq:{a[0]}"), replace=msg,
+            f"Удалить кнопку <b>{esc(f['title']) if f else ''}</b>?{warn}",
+            confirm_kb(f"fq_del_yes:{fid}", f"fq:{fid}"), replace=msg,
         )
     elif cmd == "fq_del_yes":
-        f = one("SELECT project_id FROM faq WHERE id=?", int(a[0]))
-        run("DELETE FROM faq WHERE id=?", int(a[0]))
-        if f:
+        f = one("SELECT project_id, parent_id FROM faq WHERE id=?", int(a[0]))
+        run("DELETE FROM faq WHERE id=?", int(a[0]))  # вложенные удаляются каскадом
+        if f and f["parent_id"]:
+            await show_faq_item(context, chat_id, user.id, f["parent_id"], replace=msg)
+        elif f:
             await show_faq(context, chat_id, user.id, f["project_id"], replace=msg)
         else:
             await show_projects(context, chat_id, user.id, replace=msg)
@@ -864,7 +898,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "faq_add_title":  # шаг 1: название кнопки
         if len(text) > 60:
             return await update.message.reply_text("Слишком длинное название (максимум 60 символов).")
-        context.user_data["state"] = ("faq_add_desc", state[1], text)
+        context.user_data["state"] = ("faq_add_desc", state[1], state[2], text)
         await update.message.reply_text(
             "Теперь отправьте <b>описание</b> (или «-», чтобы оставить пустым):", parse_mode=HTML
         )
@@ -873,7 +907,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "faq_add_desc":  # шаг 2: описание
         if len(text) > 3000:
             return await update.message.reply_text("Слишком длинное описание (максимум 3000 символов).")
-        context.user_data["state"] = ("faq_add_url", state[1], state[2], "" if text == "-" else text)
+        context.user_data["state"] = (
+            "faq_add_url", state[1], state[2], state[3], "" if text == "-" else text,
+        )
         await update.message.reply_text(
             "Теперь отправьте <b>ссылку на документацию</b> (https://...) "
             "или «-», чтобы пропустить:",
@@ -887,12 +923,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text(
                 "Не похоже на ссылку. Она должна начинаться с https:// (или «-», чтобы пропустить)."
             )
+        _, pid, parent, title, desc = state
         run(
-            "INSERT INTO faq(project_id, title, description, docs_url) VALUES(?,?,?,?)",
-            state[1], state[2], state[3], url,
+            "INSERT INTO faq(project_id, parent_id, title, description, docs_url) VALUES(?,?,?,?,?)",
+            pid, parent or None, title, desc, url,
         )
         context.user_data.pop("state", None)
-        return await show_faq(context, chat_id, user.id, state[1])
+        if parent:  # добавляли внутрь кнопки — остаёмся на её странице
+            return await show_faq_item(context, chat_id, user.id, parent)
+        return await show_faq(context, chat_id, user.id, pid)
 
     if kind == "faq_edit":  # изменение одного поля существующей кнопки
         _, fid, field = state
