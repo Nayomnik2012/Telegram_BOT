@@ -9,13 +9,18 @@ Telegram-бот: белый список, заявки на доступ, про
     AUTO_BACKUP - 0 отключает автокопии базы админу (по умолчанию включены)
     DOCS_URL    - ссылка на Confluence для кнопки «Документация по проектам»
                   по умолчанию (у проекта можно задать свою)     (необязательно)
+    HURMA_URL   - адрес API «Отсутствующие сегодня» в Hurma     (необязательно)
 
 Картинку меню можно также задать прямо в боте: Управление -> Картинка меню,
 либо положить файл menu.jpg рядом с bot.py.
+
+Токены Hurma (x-csrf-token, x-xsrf-token, Cookie) задаёт только администратор:
+Управление -> Отсутствующие.
 """
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -24,8 +29,10 @@ import tempfile
 import textwrap
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -91,6 +98,17 @@ FAQ_DEFAULT_TITLE = "Часто задаваемые вопросы по про�
 # иначе таблица не поместится в сообщение на телефоне.
 TABLE_WIDTHS = (18, 12, 16)
 
+# ── «Отсутствующие» (Hurma) ──
+HURMA_URL = os.environ.get(
+    "HURMA_URL", "https://alliancedigital.hurma.work/api/v1/dashboard/absent-today"
+).strip()
+ABSENT_TIMES = ((9, 0), (16, 0), (23, 0))  # автообновление по Киеву
+ABSENT_PER_PAGE = 100
+# Ширина колонок таблицы «Отсутствующие»:
+# Проект / Должность / ФИО / Причина / Даты / Телеграм. Длинный текст переносится.
+ABSENT_WIDTHS = (9, 9, 13, 10, 9, 13)
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
 HTML = ParseMode.HTML
 esc = html.escape
 
@@ -146,6 +164,13 @@ def ensure_schema() -> None:
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+        CREATE TABLE IF NOT EXISTS absent_watch(
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            email     TEXT NOT NULL UNIQUE,                  -- хранится в нижнем регистре
+            project   TEXT NOT NULL DEFAULT '',
+            position  TEXT NOT NULL DEFAULT '',
+            telegram  TEXT NOT NULL DEFAULT ''               -- username без @
+        );
         """
     )
     db.commit()
@@ -191,6 +216,19 @@ def one(sql: str, *args):
 
 def many(sql: str, *args):
     return db.execute(sql, args).fetchall()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    row = one("SELECT value FROM settings WHERE key=?", key)
+    return row["value"] if row and row["value"] is not None else default
+
+
+def set_setting(key: str, value: str, quiet: bool = False) -> None:
+    run(
+        "INSERT INTO settings(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        key, value, _quiet=quiet,
+    )
 
 
 # ───────────────────────── Роли ─────────────────────────
@@ -292,8 +330,17 @@ async def show_panel(context, chat_id: int, uid: int, replace: Message | None = 
     if role == "admin":
         rows.append([Btn("🛡 Заместители", callback_data="dep")])
         rows.append([Btn("🖼 Картинка меню", callback_data="setimg")])
+        rows.append([Btn("🚫 Отсутствующие (настройки)", callback_data="abs_cfg")])
     rows.append([Btn("⬅️ Меню", callback_data="menu")])
     await render(context, chat_id, "⚙️ <b>Управление</b>", Markup(rows), replace=replace)
+
+
+def red_btn(text: str, data: str) -> Btn:
+    """Красная кнопка (Bot API 9.4: style=danger). В старых клиентах — обычная."""
+    try:
+        return Btn(text, callback_data=data, style="danger")
+    except TypeError:  # старая версия python-telegram-bot
+        return Btn(text, callback_data=data, api_kwargs={"style": "danger"})
 
 
 async def show_projects(context, chat_id: int, uid: int, replace: Message | None = None):
@@ -301,6 +348,7 @@ async def show_projects(context, chat_id: int, uid: int, replace: Message | None
     rows = [[Btn(f"📁 {p['name']}", callback_data=f"prj:{p['id']}")] for p in projects]
     if get_role(uid) in MANAGERS:
         rows.append([Btn("➕ Добавить проект", callback_data="prj_add")])
+    rows.append([red_btn("🚫 Отсутствующие", "abs")])  # всегда последней, после всех проектов
     rows.append([Btn("⬅️ Меню", callback_data="menu")])
     text = "📁 <b>Проекты</b>" if projects else "📁 Проектов пока нет."
     await render(context, chat_id, text, Markup(rows), replace=replace)
@@ -825,6 +873,410 @@ def restore_confirm_text(path, label: str) -> str:
     )
 
 
+# ───────────────────────── Отсутствующие (Hurma API) ─────────────────────────
+
+ABSENT_LOCK = asyncio.Lock()
+
+
+def hurma_headers(csrf: str, xsrf: str, cookie: str) -> dict:
+    parts = urllib.parse.urlsplit(HURMA_URL)
+    origin = f"{parts.scheme}://{parts.netloc}/"
+    h = {
+        "accept": "application/json",
+        "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7,uk;q=0.6",
+        "referer": origin,
+        "x-requested-with": "XMLHttpRequest",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        ),
+        "Cookie": cookie,
+    }
+    if csrf:
+        h["x-csrf-token"] = csrf
+    if xsrf:
+        h["x-xsrf-token"] = xsrf
+    return h
+
+
+def hurma_fetch_all(csrf: str, xsrf: str, cookie: str) -> list[dict]:
+    """Синхронно забирает все страницы «absent-today». Бросает RuntimeError с понятным текстом."""
+    if not cookie:
+        raise RuntimeError("Не задан Cookie Hurma (Управление → Отсутствующие).")
+    headers = hurma_headers(csrf, xsrf, cookie)
+    items, page = [], 1
+    while True:
+        url = f"{HURMA_URL}?page={page}&per_page={ABSENT_PER_PAGE}"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 419):
+                raise RuntimeError(
+                    f"HTTP {e.code}: сессия Hurma истекла — обновите токены / Cookie."
+                ) from None
+            raise RuntimeError(f"Hurma ответила HTTP {e.code}.") from None
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Нет связи с Hurma: {e.reason}") from None
+        except TimeoutError:
+            raise RuntimeError("Hurma не ответила за 30 секунд.") from None
+        try:
+            js = json.loads(body)
+        except ValueError:
+            raise RuntimeError(
+                "Hurma вернула не JSON (обычно это страница входа) — обновите токены / Cookie."
+            ) from None
+        if not isinstance(js, dict) or not isinstance(js.get("data"), list):
+            raise RuntimeError("Неожиданный формат ответа Hurma (нет поля data).")
+        for it in js["data"]:
+            emp = it.get("employee") or {}
+            items.append(
+                {
+                    "email": (emp.get("email") or "").strip().lower(),
+                    "name": emp.get("name") or "",
+                    "reason": it.get("name") or "",
+                    "period": it.get("tooltipPeriod") or it.get("period") or it.get("duration") or "",
+                }
+            )
+        last = (js.get("meta") or {}).get("last_page") or 1
+        if page >= int(last) or page >= 50:
+            break
+        page += 1
+    return items
+
+
+async def refresh_absent() -> str | None:
+    """Опрашивает API и сохраняет результат. Возвращает текст ошибки или None."""
+    async with ABSENT_LOCK:
+        csrf, xsrf, cookie = (get_setting(k) for k in ("hurma_csrf", "hurma_xsrf", "hurma_cookie"))
+        try:
+            items = await asyncio.to_thread(hurma_fetch_all, csrf, xsrf, cookie)
+        except Exception as e:
+            err = str(e) or e.__class__.__name__
+            set_setting("absent_error", err, quiet=True)
+            set_setting("absent_error_at", str(time.time()), quiet=True)
+            log.warning("Отсутствующие: обновление не удалось: %s", err)
+            return err
+        set_setting("absent_cache", json.dumps(items, ensure_ascii=False), quiet=True)
+        set_setting("absent_at", str(time.time()), quiet=True)
+        set_setting("absent_error", "", quiet=True)
+        log.info("Отсутствующие: обновлено, записей в ответе API — %s", len(items))
+        return None
+
+
+async def scheduled_absent_refresh(bot) -> None:
+    if not get_setting("hurma_cookie"):
+        return  # функция ещё не настроена — молча пропускаем
+    err = await refresh_absent()
+    if err:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ Не удалось обновить «Отсутствующие»: {err}\n"
+                    "⚙️ Управление → 🚫 Отсутствующие (настройки) → обновите токены.",
+                )
+            except TelegramError:
+                pass
+
+
+def _slot(day, h: int, m: int) -> datetime:
+    return datetime(day.year, day.month, day.day, h, m, tzinfo=TZ)
+
+
+def next_absent_slot(now: datetime) -> datetime:
+    for d in (0, 1):
+        day = (now + timedelta(days=d)).date()
+        for h, m in ABSENT_TIMES:
+            t = _slot(day, h, m)
+            if t > now:
+                return t
+    return now + timedelta(hours=1)
+
+
+def prev_absent_slot(now: datetime) -> datetime:
+    for d in (0, -1):
+        day = (now + timedelta(days=d)).date()
+        for h, m in reversed(ABSENT_TIMES):
+            t = _slot(day, h, m)
+            if t <= now:
+                return t
+    return now - timedelta(days=1)
+
+
+async def absent_loop(bot) -> None:
+    """Автообновление в 09:00, 16:00 и 23:00 (Киев). После перезапуска — догоняет пропуск."""
+    try:
+        at = float(get_setting("absent_at") or 0)
+        if at < prev_absent_slot(datetime.now(TZ)).timestamp():
+            await scheduled_absent_refresh(bot)
+    except Exception:
+        log.exception("Отсутствующие: ошибка при стартовом обновлении")
+    while True:
+        now = datetime.now(TZ)
+        nxt = next_absent_slot(now)
+        await asyncio.sleep(max(1.0, (nxt - now).total_seconds()))
+        try:
+            await scheduled_absent_refresh(bot)
+        except Exception:
+            log.exception("Отсутствующие: ошибка автообновления")
+
+
+def fmt_ts(ts: str) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts), TZ).strftime("%d.%m.%Y %H:%M")
+    except (TypeError, ValueError):
+        return "—"
+
+
+def text_table(headers: tuple, data: list[tuple], max_widths: tuple) -> tuple[list[str], list[list[str]]]:
+    """Моноширинная таблица с переносом. Возвращает (строки шапки, список блоков строк)."""
+    n = len(headers)
+    widths = [max(1, min(max(len(r[i]) for r in [headers] + data), max_widths[i])) for i in range(n)]
+
+    def fmt_row(cells) -> list[str]:
+        wrapped = [textwrap.wrap(c, widths[i]) or [""] for i, c in enumerate(cells)]
+        height = max(len(w) for w in wrapped)
+        return [
+            "│".join(
+                (wrapped[i][k] if k < len(wrapped[i]) else "").ljust(widths[i]) for i in range(n)
+            ).rstrip()
+            for k in range(height)
+        ]
+
+    sep = "┼".join("─" * w for w in widths)
+    head = fmt_row(headers) + [sep]
+    blocks = []
+    for idx, row in enumerate(data):
+        block = fmt_row(row)
+        if idx < len(data) - 1:
+            block.append(sep)
+        blocks.append(block)
+    return head, blocks
+
+
+def absent_rows() -> list[tuple]:
+    """Строки таблицы: только сотрудники из списка администратора (полное совпадение email)."""
+    watch = {w["email"].strip().lower(): w for w in many("SELECT * FROM absent_watch")}
+    try:
+        data = json.loads(get_setting("absent_cache") or "[]")
+    except ValueError:
+        data = []
+    rows = []
+    for it in data:
+        w = watch.get((it.get("email") or "").strip().lower())
+        if not w:
+            continue
+        rows.append(
+            (
+                w["project"] or "—",
+                w["position"] or "—",
+                it.get("name") or "—",
+                it.get("reason") or "—",
+                it.get("period") or "—",
+                f"@{w['telegram']}" if w["telegram"] else "—",
+            )
+        )
+    rows.sort(key=lambda r: (r[0].lower(), r[2].lower()))
+    return rows
+
+
+async def render_many(context, chat_id: int, chunks: list[str], kb: Markup, replace: Message | None):
+    """Как render, но для длинного текста, разбитого на несколько сообщений."""
+    if len(chunks) == 1:
+        return await render(context, chat_id, chunks[0], kb, replace=replace)
+    if replace is not None:
+        try:
+            await replace.delete()
+        except TelegramError:
+            pass
+    for c in chunks[:-1]:
+        await context.bot.send_message(chat_id, c, parse_mode=HTML)
+    await context.bot.send_message(chat_id, chunks[-1], reply_markup=kb, parse_mode=HTML)
+
+
+async def show_absent(context, chat_id: int, uid: int, replace: Message | None = None, note: str = ""):
+    """Экран «Отсутствующие» — видят все пользователи с доступом."""
+    is_admin = get_role(uid) == "admin"
+    rows_kb = []
+    if is_admin:
+        rows_kb.append(
+            [
+                Btn("🔄 Обновить сейчас", callback_data="abs_upd:v"),
+                Btn("⚙️ Настройки", callback_data="abs_cfg"),
+            ]
+        )
+    rows_kb.append([Btn("⬅️ Проекты", callback_data="prj:list"), Btn("🏠 Меню", callback_data="menu")])
+    kb = Markup(rows_kb)
+
+    head = ["🚫 <b>Отсутствующие сегодня</b>"]
+    at = get_setting("absent_at")
+    head.append(f"🕒 Обновлено: {fmt_ts(at)}" if at else "🕒 Данные ещё не загружались.")
+    err = get_setting("absent_error")
+    if err:
+        head.append(f"⚠️ Последнее обновление не удалось ({fmt_ts(get_setting('absent_error_at'))}).")
+        if is_admin:
+            head.append(f"<i>{esc(err)}</i>")
+    if note:
+        head.append(note)
+    title = "\n".join(head)
+
+    if not one("SELECT 1 FROM absent_watch LIMIT 1"):
+        msg = "\n\nСписок сотрудников для отслеживания пуст."
+        if is_admin:
+            msg += "\nДобавьте их: ⚙️ Настройки → 👤 Сотрудники."
+        return await render(context, chat_id, title + msg, kb, replace=replace)
+
+    data = absent_rows()
+    if not data:
+        text = title + ("\n\n✅ Сегодня все на месте." if at else "")
+        return await render(context, chat_id, text, kb, replace=replace)
+
+    headers = ("Проект", "Должность", "ФИО", "Причина", "Даты", "Телеграм")
+    thead, blocks = text_table(headers, data, ABSENT_WIDTHS)
+
+    # Разбиваем на сообщения (лимит Telegram — 4096 символов)
+    limit = 3800
+    chunks, cur = [], []
+    prefix = title + "\n\n"
+    for b in blocks:
+        trial = esc("\n".join(thead + cur + b))
+        if cur and len(prefix) + len(trial) + 11 > limit:
+            chunks.append(prefix + f"<pre>{esc(chr(10).join(thead + cur))}</pre>")
+            prefix, cur = "", []
+        cur += b
+    chunks.append(prefix + f"<pre>{esc(chr(10).join(thead + cur))}</pre>")
+
+    # Ники отдельно в <code> — нажатие копирует ник в буфер обмена
+    tg = []
+    for r in data:
+        if r[5] != "—" and r[5] not in tg:
+            tg.append(r[5])
+    if tg:
+        copy = "📋 <b>Нажмите на ник, чтобы скопировать:</b>\n" + "\n".join(
+            f"<code>{esc(t)}</code>" for t in tg
+        )
+        if len(chunks[-1]) + len(copy) + 2 <= 4000:
+            chunks[-1] += "\n\n" + copy
+        else:
+            chunks.append(copy)
+    await render_many(context, chat_id, chunks, kb, replace)
+
+
+def mask(value: str) -> str:
+    if not value:
+        return "❌ не задан"
+    return f"✅ задан (<code>{esc(value[:6])}…</code>, {len(value)} симв.)"
+
+
+async def show_absent_cfg(context, chat_id: int, replace: Message | None = None, note: str = ""):
+    """Настройки «Отсутствующих» — только администратор."""
+    n = one("SELECT COUNT(*) AS n FROM absent_watch")["n"]
+    at, err = get_setting("absent_at"), get_setting("absent_error")
+    times = ", ".join(f"{h:02d}:{m:02d}" for h, m in ABSENT_TIMES)
+    lines = [
+        "🚫 <b>Отсутствующие — настройки</b>",
+        "",
+        f"👤 Сотрудников в списке: {n}",
+        f"🕒 Последнее успешное обновление: {fmt_ts(at) if at else '—'}",
+    ]
+    if err:
+        lines.append(f"⚠️ Ошибка ({fmt_ts(get_setting('absent_error_at'))}): <i>{esc(err)}</i>")
+    lines += [
+        f"⏰ Автообновление: {times} (Киев)",
+        "",
+        f"x-csrf-token: {mask(get_setting('hurma_csrf'))}",
+        f"x-xsrf-token: {mask(get_setting('hurma_xsrf'))}",
+        f"Cookie: {mask(get_setting('hurma_cookie'))}",
+        "",
+        "<i>Hurma проверяет сессию по Cookie (hurma_session / remember_web_…). "
+        "Проще всего: DevTools → Network → absent-today → Copy as cURL (bash) "
+        "и отправить боту через «📋 Вставить cURL».</i>",
+    ]
+    if note:
+        lines += ["", note]
+    rows = [
+        [Btn(f"👤 Сотрудники ({n})", callback_data="abs_list")],
+        [Btn("📋 Вставить cURL целиком", callback_data="abs_curl")],
+        [
+            Btn("🔑 x-csrf-token", callback_data="abs_tok:csrf"),
+            Btn("🔑 x-xsrf-token", callback_data="abs_tok:xsrf"),
+        ],
+        [Btn("🍪 Cookie", callback_data="abs_tok:cookie")],
+        [Btn("🔄 Обновить сейчас", callback_data="abs_upd:c")],
+        [red_btn("🚫 Открыть таблицу", "abs")],
+        [Btn("⬅️ Управление", callback_data="adm")],
+    ]
+    await render(context, chat_id, "\n".join(lines), Markup(rows), replace=replace)
+
+
+async def show_absent_list(context, chat_id: int, replace: Message | None = None):
+    items = many("SELECT * FROM absent_watch ORDER BY project COLLATE NOCASE, email")
+    lines = ["👤 <b>Сотрудники для отслеживания</b>", "Поиск — по полному совпадению email в ответе API.", ""]
+    for i, w in enumerate(items, 1):
+        tg = f"@{w['telegram']}" if w["telegram"] else "—"
+        lines.append(
+            f"{i}. <code>{esc(w['email'])}</code>\n"
+            f"    {esc(w['project'] or '—')} · {esc(w['position'] or '—')} · {esc(tg)}"
+        )
+    if not items:
+        lines.append("Список пуст.")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "\n…"
+    rows = [[Btn(f"❌ {w['email']}"[:60], callback_data=f"abs_del:{w['id']}")] for w in items]
+    rows.append([Btn("➕ Добавить сотрудника", callback_data="abs_add")])
+    rows.append([Btn("⬅️ Назад", callback_data="abs_cfg")])
+    await render(context, chat_id, text, Markup(rows), replace=replace)
+
+
+def clean_header_value(text: str, name: str) -> str:
+    """Убирает «--header», кавычки и «name:» — можно вставить строку прямо из cURL."""
+    t = text.strip()
+    t = re.sub(r"^(?:-H|--header|-b|--cookie)\s+", "", t)
+    t = t.strip().lstrip("$").strip("'\"").strip()
+    if t.lower().startswith(name.lower() + ":"):
+        t = t[len(name) + 1:].strip()
+    return t.strip("'\"").strip()
+
+
+def sync_cookie_xsrf(cookie: str, xsrf: str) -> str:
+    """Подставляет новый x-xsrf-token в cookie XSRF-TOKEN (если он там есть)."""
+    if not cookie or not xsrf:
+        return cookie
+    enc = urllib.parse.quote(urllib.parse.unquote(xsrf), safe="")
+    return re.sub(r"XSRF-TOKEN=[^;]*", lambda _: f"XSRF-TOKEN={enc}", cookie)
+
+
+def parse_curl(text: str) -> dict:
+    """Достаёт x-csrf-token, x-xsrf-token и Cookie из команды cURL (формат bash)."""
+    found = {}
+    for m in re.finditer(r"(?:-H|--header)\s+\$?(['\"])(.*?)\1", text, re.S):
+        key, _, val = m.group(2).partition(":")
+        key = key.strip().lower()
+        if key in ("x-csrf-token", "x-xsrf-token", "cookie"):
+            found[key] = val.strip()
+    m = re.search(r"(?:-b|--cookie)\s+\$?(['\"])(.*?)\1", text, re.S)
+    if m and "cookie" not in found:
+        found["cookie"] = m.group(2).strip()
+    return found
+
+
+def apply_curl(text: str) -> str:
+    """Сохраняет найденные в cURL параметры. Возвращает текст результата."""
+    found = parse_curl(text)
+    if not found:
+        return (
+            "❌ В тексте не найдено ни x-csrf-token, ни x-xsrf-token, ни Cookie. "
+            "Скопируйте запрос как «Copy as cURL (bash)»."
+        )
+    names = {"x-csrf-token": "hurma_csrf", "x-xsrf-token": "hurma_xsrf", "cookie": "hurma_cookie"}
+    for k, v in found.items():
+        set_setting(names[k], v)
+    return "✅ Обновлено: " + ", ".join(found) + "."
+
+
 # ───────────────────────── Обработчики ─────────────────────────
 
 MANAGER_CMDS = {
@@ -834,7 +1286,11 @@ MANAGER_CMDS = {
     "bk", "rs", "rs_fast", "rs_yes",
     "mdel", "prj_del", "prj_del_yes", "usr", "usr_del", "usr_del_yes",
 }
-ADMIN_CMDS = {"dep", "dep_t", "setimg", "rs_file"}
+ADMIN_CMDS = {
+    "dep", "dep_t", "setimg", "rs_file",
+    "abs_cfg", "abs_list", "abs_add", "abs_prj", "abs_del", "abs_del_yes",
+    "abs_tok", "abs_curl", "abs_upd",
+}
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1116,6 +1572,74 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     Markup([[Btn("⚙️ Управление", callback_data="adm")]]), replace=msg,
                 )
 
+    # ── отсутствующие ──
+    elif cmd == "abs":  # таблица — всем пользователям с доступом
+        await show_absent(context, chat_id, user.id, replace=msg)
+    elif cmd == "abs_cfg":
+        await show_absent_cfg(context, chat_id, replace=msg)
+    elif cmd == "abs_list":
+        context.user_data.pop("abs_new", None)
+        await show_absent_list(context, chat_id, replace=msg)
+    elif cmd == "abs_add":
+        context.user_data.pop("abs_new", None)
+        await ask(
+            context, chat_id, msg,
+            "Введите <b>email</b> сотрудника — точно как в Hurma (поле employee.email):",
+            ("abs_email",), cancel="abs_list",
+        )
+    elif cmd == "abs_prj":  # выбор проекта из списка при добавлении сотрудника
+        new = context.user_data.get("abs_new")
+        p = one("SELECT name FROM projects WHERE id=?", int(a[0]))
+        if not new or not p:
+            return await show_absent_list(context, chat_id, replace=msg)
+        new["project"] = p["name"]
+        await ask(
+            context, chat_id, msg,
+            f"Проект: <b>{esc(p['name'])}</b>\nТеперь введите <b>должность</b> (или «-»):",
+            ("abs_pos",), cancel="abs_list",
+        )
+    elif cmd == "abs_del":
+        w = one("SELECT * FROM absent_watch WHERE id=?", int(a[0]))
+        if not w:
+            return await show_absent_list(context, chat_id, replace=msg)
+        await render(
+            context, chat_id,
+            f"Убрать из отслеживания <code>{esc(w['email'])}</code>?",
+            confirm_kb(f"abs_del_yes:{a[0]}", "abs_list"), replace=msg,
+        )
+    elif cmd == "abs_del_yes":
+        run("DELETE FROM absent_watch WHERE id=?", int(a[0]))
+        await show_absent_list(context, chat_id, replace=msg)
+    elif cmd == "abs_tok":
+        prompts = {
+            "csrf": "Отправьте новый <b>x-csrf-token</b>\n(можно строкой из cURL: <code>x-csrf-token: …</code>).",
+            "xsrf": "Отправьте новый <b>x-xsrf-token</b>\n(XSRF-TOKEN в Cookie обновится автоматически).",
+            "cookie": "Отправьте новое значение заголовка <b>Cookie</b> целиком\n"
+                      "(должны быть hurma_session и remember_web_…).",
+        }
+        if a and a[0] in prompts:
+            await ask(context, chat_id, msg, prompts[a[0]] + "\n\n🔒 Сообщение с токеном бот удалит.",
+                      ("abs_tok", a[0]), cancel="abs_cfg")
+        else:
+            await show_absent_cfg(context, chat_id, replace=msg)
+    elif cmd == "abs_curl":
+        await ask(
+            context, chat_id, msg,
+            "Отправьте запрос <b>absent-today</b> из браузера:\n"
+            "DevTools → Network → absent-today → ПКМ → Copy → <b>Copy as cURL (bash)</b>.\n\n"
+            "Если текст длиннее 4096 символов — пришлите его файлом <b>.txt</b>.\n"
+            "Бот возьмёт x-csrf-token, x-xsrf-token и Cookie.\n\n🔒 Сообщение бот удалит.",
+            ("abs_curl",), cancel="abs_cfg",
+        )
+    elif cmd == "abs_upd":
+        await render(context, chat_id, "⏳ Запрашиваю данные в Hurma…", None, replace=msg)
+        err = await refresh_absent()
+        note = f"❌ {esc(err)}" if err else "✅ Данные обновлены."
+        if a and a[0] == "c":
+            await show_absent_cfg(context, chat_id, replace=msg, note=note)
+        else:
+            await show_absent(context, chat_id, user.id, replace=msg, note=note)
+
     # ── только администратор ──
     elif cmd == "dep":
         await show_deputies(context, chat_id, replace=msg)
@@ -1138,6 +1662,106 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask(context, chat_id, msg, "Отправьте картинку для главного меню (как фото):", ("set_image",))
 
 
+async def on_absent_text(update: Update, context: ContextTypes.DEFAULT_TYPE, state: tuple, text: str):
+    """Ввод текста в разделе «Отсутствующие» (только администратор)."""
+    chat_id = update.effective_chat.id
+    kind = state[0]
+    cancel_kb = Markup([[Btn("✖️ Отмена", callback_data="abs_list")]])
+
+    if kind in ("abs_tok", "abs_curl"):
+        try:
+            await update.message.delete()  # не оставляем токены в истории чата
+        except TelegramError:
+            pass
+        if kind == "abs_curl":
+            note = apply_curl(update.message.text)
+        else:
+            field = state[1]
+            name = {"csrf": "x-csrf-token", "xsrf": "x-xsrf-token", "cookie": "Cookie"}[field]
+            value = clean_header_value(update.message.text, name)
+            if not value or (field != "cookie" and re.search(r"\s", value)) or (
+                field == "cookie" and "=" not in value
+            ):
+                return await context.bot.send_message(
+                    chat_id, f"❌ Не похоже на {name}. Попробуйте ещё раз или нажмите «Отмена».",
+                    reply_markup=Markup([[Btn("✖️ Отмена", callback_data="abs_cfg")]]),
+                )
+            set_setting(f"hurma_{field}", value)
+            if field == "xsrf":
+                set_setting("hurma_cookie", sync_cookie_xsrf(get_setting("hurma_cookie"), value))
+            note = f"✅ {name} обновлён."
+        context.user_data.pop("state", None)
+        return await show_absent_cfg(context, chat_id, note=note)
+
+    new = context.user_data.get("abs_new")
+
+    if kind == "abs_email":
+        email = text.strip().lower()
+        if not EMAIL_RE.fullmatch(email) or len(email) > 200:
+            return await update.message.reply_text("Не похоже на email. Попробуйте ещё раз:", reply_markup=cancel_kb)
+        if one("SELECT 1 FROM absent_watch WHERE email=?", email):
+            return await update.message.reply_text(
+                "Этот email уже в списке. Введите другой:", reply_markup=cancel_kb
+            )
+        context.user_data["abs_new"] = {"email": email}
+        context.user_data["state"] = ("abs_project",)
+        projects = many("SELECT id, name FROM projects ORDER BY name COLLATE NOCASE")
+        rows = [[Btn(f"📁 {p['name']}"[:60], callback_data=f"abs_prj:{p['id']}")] for p in projects]
+        rows.append([Btn("✖️ Отмена", callback_data="abs_list")])
+        return await update.message.reply_text(
+            "Выберите <b>проект</b> кнопкой или введите название вручную:",
+            parse_mode=HTML, reply_markup=Markup(rows),
+        )
+
+    if not new:  # данные шага потерялись (например, после перезапуска)
+        context.user_data.pop("state", None)
+        return await show_absent_list(context, chat_id)
+
+    if kind == "abs_project":
+        if len(text) > 100:
+            return await update.message.reply_text("Слишком длинное название (максимум 100 символов).")
+        new["project"] = "" if text == "-" else text
+        context.user_data["state"] = ("abs_pos",)
+        return await update.message.reply_text(
+            "Теперь введите <b>должность</b> (или «-»):", parse_mode=HTML, reply_markup=cancel_kb
+        )
+
+    if kind == "abs_pos":
+        if len(text) > 100:
+            return await update.message.reply_text("Слишком длинная должность (максимум 100 символов).")
+        new["position"] = "" if text == "-" else text
+        context.user_data["state"] = ("abs_tg",)
+        return await update.message.reply_text(
+            "Теперь введите <b>адрес в Telegram</b>: @username или ссылку t.me/username (или «-»):",
+            parse_mode=HTML, reply_markup=cancel_kb,
+        )
+
+    if kind == "abs_tg":
+        if text == "-":
+            tg = ""
+        else:
+            parts = text.split()
+            tg = extract_username(parts[0]) if len(parts) == 1 else None
+            if not tg:
+                return await update.message.reply_text(
+                    "Не похоже на username. Пришлите @username или ссылку t.me/username:",
+                    reply_markup=cancel_kb,
+                )
+        try:
+            run(
+                "INSERT INTO absent_watch(email, project, position, telegram) VALUES(?,?,?,?)",
+                new["email"], new.get("project", ""), new.get("position", ""), tg,
+            )
+        except sqlite3.IntegrityError:
+            pass  # уже добавлен
+        context.user_data.pop("state", None)
+        context.user_data.pop("abs_new", None)
+        return await show_absent_list(context, chat_id)
+
+    context.user_data.pop("state", None)
+    await show_absent_list(context, chat_id)
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -1148,6 +1772,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
     kind = state[0]
+
+    if kind.startswith("abs_"):
+        if get_role(user.id) != "admin":
+            context.user_data.pop("state", None)
+            return await show_menu(context, chat_id, user.id)
+        return await on_absent_text(update, context, state, text)
 
     if kind == "add_prj_name":
         if len(text) > 100:
@@ -1333,6 +1963,19 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Файл копии от администратора для восстановления."""
     user = update.effective_user
     doc = update.message.document
+    if get_role(user.id) == "admin" and context.user_data.get("state") == ("abs_curl",):
+        # cURL с токенами Hurma, присланный файлом .txt
+        context.user_data.pop("state", None)
+        if doc.file_size and doc.file_size > 1024 * 1024:
+            return await update.message.reply_text("Файл слишком большой (максимум 1 МБ).")
+        tg_file = await context.bot.get_file(doc.file_id)
+        raw = bytes(await tg_file.download_as_bytearray())
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        note = apply_curl(raw.decode("utf-8", "replace"))
+        return await show_absent_cfg(context, update.effective_chat.id, note=note)
     if get_role(user.id) == "admin" and context.user_data.get("state") == ("restore_file",):
         context.user_data.pop("state", None)
         if doc.file_size and doc.file_size > 20 * 1024 * 1024:
@@ -1415,6 +2058,11 @@ async def post_init(app: Application) -> None:
     if AUTO_BACKUP:
         app.bot_data["backup_task"] = asyncio.create_task(backup_loop(app.bot))
         log.info("Автокопии включены: после изменений данных копия уходит админам и закрепляется")
+    app.bot_data["absent_task"] = asyncio.create_task(absent_loop(app.bot))
+    log.info(
+        "Отсутствующие: автообновление в %s (Киев)",
+        ", ".join(f"{h:02d}:{m:02d}" for h, m in ABSENT_TIMES),
+    )
 
 
 def main():
