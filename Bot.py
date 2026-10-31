@@ -1030,30 +1030,51 @@ def fmt_ts(ts: str) -> str:
         return "—"
 
 
-def text_table(headers: tuple, data: list[tuple], max_widths: tuple) -> tuple[list[str], list[list[str]]]:
-    """Моноширинная таблица с переносом. Возвращает (строки шапки, список блоков строк)."""
-    n = len(headers)
-    widths = [max(1, min(max(len(r[i]) for r in [headers] + data), max_widths[i])) for i in range(n)]
+def text_table(headers: tuple, data: list[tuple], max_widths: tuple, nowrap: tuple = ()):
+    """Моноширинная таблица с переносом.
 
-    def fmt_row(cells) -> list[str]:
+    Возвращает (строки шапки, блоки строк по записям, ширины). Каждая строка — список
+    ячеек, уже дополненных пробелами; None — строка-разделитель.
+    Колонки из nowrap не переносятся (ширина = самое длинное значение).
+    """
+    n = len(headers)
+    widths = []
+    for i in range(n):
+        longest = max(len(r[i]) for r in [headers] + data)
+        widths.append(max(1, longest if i in nowrap else min(longest, max_widths[i])))
+
+    def fmt_row(cells) -> list[list[str]]:
         wrapped = [textwrap.wrap(c, widths[i]) or [""] for i, c in enumerate(cells)]
         height = max(len(w) for w in wrapped)
         return [
-            "│".join(
-                (wrapped[i][k] if k < len(wrapped[i]) else "").ljust(widths[i]) for i in range(n)
-            ).rstrip()
+            [(wrapped[i][k] if k < len(wrapped[i]) else "").ljust(widths[i]) for i in range(n)]
             for k in range(height)
         ]
 
-    sep = "┼".join("─" * w for w in widths)
-    head = fmt_row(headers) + [sep]
+    head = fmt_row(headers) + [None]
     blocks = []
     for idx, row in enumerate(data):
         block = fmt_row(row)
         if idx < len(data) - 1:
-            block.append(sep)
+            block.append(None)
         blocks.append(block)
-    return head, blocks
+    return head, blocks, widths
+
+
+def absent_line_html(cells, widths) -> str:
+    """Строка таблицы «Отсутствующие»: первые колонки — один <code>, Телеграм — отдельный.
+
+    Нажатие на ник копирует только ник (в <pre> копируется вся таблица целиком).
+    Символ «│» между ними — обычный текст, поэтому сущности не сливаются.
+    """
+    if cells is None:  # разделитель
+        left = "┼".join("─" * w for w in widths[:-1])
+        return f"<code>{left}</code>┼<code>{'─' * widths[-1]}</code>"
+    left = esc("│".join(cells[:-1]))
+    last = cells[-1].strip()
+    if not last.startswith("@"):  # «—» или заголовок — копировать нечего
+        return f"<code>{left}</code>│{esc(last)}"
+    return f"<code>{left}</code>│<code>{esc(last)}</code>"
 
 
 def absent_rows() -> list[tuple]:
@@ -1134,33 +1155,21 @@ async def show_absent(context, chat_id: int, uid: int, replace: Message | None =
         return await render(context, chat_id, text, kb, replace=replace)
 
     headers = ("Проект", "Должность", "ФИО", "Причина", "Даты", "Телеграм")
-    thead, blocks = text_table(headers, data, ABSENT_WIDTHS)
+    thead, blocks, widths = text_table(headers, data, ABSENT_WIDTHS, nowrap=(5,))
+
+    def table_html(lines) -> str:
+        return "\n".join(absent_line_html(c, widths) for c in thead + lines)
 
     # Разбиваем на сообщения (лимит Telegram — 4096 символов)
     limit = 3800
     chunks, cur = [], []
-    prefix = title + "\n\n"
+    prefix = title + "\n<i>Нажмите на ник в колонке «Телеграм», чтобы скопировать его.</i>\n\n"
     for b in blocks:
-        trial = esc("\n".join(thead + cur + b))
-        if cur and len(prefix) + len(trial) + 11 > limit:
-            chunks.append(prefix + f"<pre>{esc(chr(10).join(thead + cur))}</pre>")
+        if cur and len(prefix) + len(table_html(cur + b)) > limit:
+            chunks.append(prefix + table_html(cur))
             prefix, cur = "", []
         cur += b
-    chunks.append(prefix + f"<pre>{esc(chr(10).join(thead + cur))}</pre>")
-
-    # Ники отдельно в <code> — нажатие копирует ник в буфер обмена
-    tg = []
-    for r in data:
-        if r[5] != "—" and r[5] not in tg:
-            tg.append(r[5])
-    if tg:
-        copy = "📋 <b>Нажмите на ник, чтобы скопировать:</b>\n" + "\n".join(
-            f"<code>{esc(t)}</code>" for t in tg
-        )
-        if len(chunks[-1]) + len(copy) + 2 <= 4000:
-            chunks[-1] += "\n\n" + copy
-        else:
-            chunks.append(copy)
+    chunks.append(prefix + table_html(cur))
     await render_many(context, chat_id, chunks, kb, replace)
 
 
