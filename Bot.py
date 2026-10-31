@@ -1061,20 +1061,21 @@ def text_table(headers: tuple, data: list[tuple], max_widths: tuple, nowrap: tup
     return head, blocks, widths
 
 
-def absent_line_html(cells, widths) -> str:
-    """Строка таблицы «Отсутствующие»: первые колонки — один <code>, Телеграм — отдельный.
+def table_line(cells, widths) -> str:
+    """Одна строка моноширинной таблицы (None — разделитель)."""
+    if cells is None:
+        return "┼".join("─" * w for w in widths)
+    return "│".join(cells).rstrip()
 
-    Нажатие на ник копирует только ник (в <pre> копируется вся таблица целиком).
-    Символ «│» между ними — обычный текст, поэтому сущности не сливаются.
-    """
-    if cells is None:  # разделитель
-        left = "┼".join("─" * w for w in widths[:-1])
-        return f"<code>{left}</code>┼<code>{'─' * widths[-1]}</code>"
-    left = esc("│".join(cells[:-1]))
-    last = cells[-1].strip()
-    if not last.startswith("@"):  # «—» или заголовок — копировать нечего
-        return f"<code>{left}</code>│{esc(last)}"
-    return f"<code>{left}</code>│<code>{esc(last)}</code>"
+
+def copy_btn(nick: str) -> Btn:
+    """Кнопка, которая по нажатию копирует ник в буфер обмена (Bot API 7.11+)."""
+    try:
+        from telegram import CopyTextButton
+
+        return Btn(f"📋 {nick}", copy_text=CopyTextButton(nick))
+    except (ImportError, TypeError):  # старая версия python-telegram-bot
+        return Btn(f"📋 {nick}", api_kwargs={"copy_text": {"text": nick}})
 
 
 def absent_rows() -> list[tuple]:
@@ -1158,12 +1159,22 @@ async def show_absent(context, chat_id: int, uid: int, replace: Message | None =
     thead, blocks, widths = text_table(headers, data, ABSENT_WIDTHS, nowrap=(5,))
 
     def table_html(lines) -> str:
-        return "\n".join(absent_line_html(c, widths) for c in thead + lines)
+        return "<pre>" + esc("\n".join(table_line(c, widths) for c in thead + lines)) + "</pre>"
+
+    # Ровная таблица в <pre>; копирование ников — отдельными кнопками под ней
+    nicks = []
+    for r in data:
+        if r[5].startswith("@") and r[5] not in nicks:
+            nicks.append(r[5])
+    if nicks:
+        copy_rows = [[copy_btn(n) for n in nicks[i:i + 2]] for i in range(0, len(nicks), 2)]
+        kb = Markup(copy_rows + rows_kb)
 
     # Разбиваем на сообщения (лимит Telegram — 4096 символов)
     limit = 3800
     chunks, cur = [], []
-    prefix = title + "\n<i>Нажмите на ник в колонке «Телеграм», чтобы скопировать его.</i>\n\n"
+    hint = "\n<i>📋 Нажмите кнопку с ником ниже — он скопируется.</i>" if nicks else ""
+    prefix = title + hint + "\n\n"
     for b in blocks:
         if cur and len(prefix) + len(table_html(cur + b)) > limit:
             chunks.append(prefix + table_html(cur))
