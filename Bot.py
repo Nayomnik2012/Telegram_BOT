@@ -16,6 +16,12 @@ Telegram-бот: белый список, заявки на доступ, про
 
 Токены Hurma (x-csrf-token, x-xsrf-token, Cookie) задаёт только администратор:
 Управление -> Отсутствующие.
+
+Групповые чаты: если бота добавить в группу, он отвечает на сообщения, в которых
+тегнули сотрудника из таблицы «Отсутствующие» («Сотрудник отсутствует» + даты).
+Для этого у бота должен быть выключен Group Privacy (@BotFather -> Bot Settings ->
+Group Privacy -> Turn off; после этого бота нужно удалить из группы и добавить заново)
+либо бот должен быть администратором группы.
 """
 
 import asyncio
@@ -108,6 +114,12 @@ ABSENT_PER_PAGE = 100
 # Проект / Должность / ФИО / Причина / Даты / Телеграм. Длинный текст переносится.
 ABSENT_WIDTHS = (9, 9, 13, 10, 9, 13)
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+# ── Упоминания отсутствующих в групповых чатах ──
+# Не повторять предупреждение об одном и том же сотруднике тому же человеку в том же чате
+ABSENT_MENTION_COOLDOWN = 600  # секунд
+ABSENT_CACHE_MAX_AGE = 24 * 3600  # данные Hurma старше суток не используем
+_mention_seen: dict[tuple, float] = {}
 
 HTML = ParseMode.HTML
 esc = html.escape
@@ -1297,6 +1309,88 @@ def apply_curl(text: str) -> str:
     return "✅ Обновлено: " + ", ".join(found) + "."
 
 
+# ───────────────────────── Упоминания отсутствующих в группах ─────────────────────────
+
+
+def absent_by_nick() -> dict[str, dict]:
+    """{username в нижнем регистре: {nick, name, period}}: кто из списка администратора отсутствует сегодня."""
+    try:
+        if time.time() - float(get_setting("absent_at") or 0) > ABSENT_CACHE_MAX_AGE:
+            return {}
+        data = json.loads(get_setting("absent_cache") or "[]")
+    except ValueError:
+        return {}
+    by_email = {(it.get("email") or "").strip().lower(): it for it in data}
+    out = {}
+    for w in many("SELECT email, telegram FROM absent_watch WHERE telegram != ''"):
+        it = by_email.get(w["email"].strip().lower())
+        if it:
+            out[w["telegram"].lower()] = {
+                "nick": w["telegram"],
+                "name": it.get("name") or "",
+                "period": it.get("period") or "",
+            }
+    return out
+
+
+def mentioned_nicks(msg: Message) -> list[str]:
+    """Все username, упомянутые в тексте или подписи (@nick и упоминания без username)."""
+    types = ["mention", "text_mention"]
+    found = {**msg.parse_entities(types), **msg.parse_caption_entities(types)}
+    nicks = []
+    for ent, txt in found.items():
+        if ent.type == "text_mention":
+            nick = ent.user.username if ent.user else None
+        else:
+            nick = txt.lstrip("@")
+        if nick and nick.lower() not in nicks:
+            nicks.append(nick.lower())
+    return nicks
+
+
+async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Групповой чат: тегнули отсутствующего — отвечаем тому, кто тегнул."""
+    msg = update.effective_message
+    if not msg or not msg.from_user or msg.from_user.is_bot:
+        return
+    nicks = mentioned_nicks(msg)
+    if not nicks:
+        return
+    absent = absent_by_nick()
+    if not absent:
+        return
+
+    now = time.time()
+    for k, t in list(_mention_seen.items()):  # чистим устаревшие записи антиспама
+        if now - t > ABSENT_MENTION_COOLDOWN:
+            del _mention_seen[k]
+
+    lines = []
+    for n in nicks:
+        a = absent.get(n)
+        if not a:
+            continue
+        key = (msg.chat_id, msg.from_user.id, n)
+        if key in _mention_seen:
+            continue
+        _mention_seen[key] = now
+        # Ник в <code>, чтобы бот не тегал отсутствующего повторно
+        who = f"<code>@{esc(a['nick'])}</code>"
+        if a["name"]:
+            who += f" ({esc(a['name'])})"
+        line = f"🚫 <b>Сотрудник отсутствует</b>: {who}"
+        if a["period"]:
+            line += f"\n📅 Не будет: {esc(a['period'])}"
+        lines.append(line)
+
+    if not lines:
+        return
+    try:
+        await msg.reply_text("\n\n".join(lines), parse_mode=HTML)  # ответ на сообщение с тегом
+    except TelegramError as e:
+        log.warning("Не удалось ответить в чате %s: %s", msg.chat_id, e)
+
+
 # ───────────────────────── Обработчики ─────────────────────────
 
 MANAGER_CMDS = {
@@ -2092,10 +2186,19 @@ def main():
     start_keepalive()
 
     private = filters.ChatType.PRIVATE
+    group_mentions = (
+        filters.ChatType.GROUPS
+        & filters.UpdateType.MESSAGE  # отредактированные сообщения не трогаем
+        & (
+            filters.Entity("mention") | filters.Entity("text_mention")
+            | filters.CaptionEntity("mention") | filters.CaptionEntity("text_mention")
+        )
+    )
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler(["start", "menu"], cmd_start, filters=private))
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(group_mentions, on_group_message))
     app.add_handler(MessageHandler(filters.PHOTO & private, on_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & private, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & private, on_text))
