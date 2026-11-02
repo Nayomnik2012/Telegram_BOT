@@ -17,6 +17,10 @@ Telegram-бот: белый список, заявки на доступ, про
 Токены Hurma (x-csrf-token, x-xsrf-token, Cookie) задаёт только администратор:
 Управление -> Отсутствующие.
 
+Расписание автообновления «Отсутствующих» (сколько раз в день и в какое время)
+задаёт администратор: Управление -> Отсутствующие (настройки) -> Расписание.
+По умолчанию — 09:00, 16:00, 23:00 (Киев).
+
 Групповые чаты: если бота добавить в группу, он отвечает на сообщения, в которых
 тегнули сотрудника из таблицы «Отсутствующие» («Сотрудник отсутствует» + даты).
 Для этого у бота должен быть выключен Group Privacy (@BotFather -> Bot Settings ->
@@ -108,7 +112,17 @@ TABLE_WIDTHS = (18, 12, 16)
 HURMA_URL = os.environ.get(
     "HURMA_URL", "https://alliancedigital.hurma.work/api/v1/dashboard/absent-today"
 ).strip()
-ABSENT_TIMES = ((9, 0), (16, 0), (23, 0))  # автообновление по Киеву
+# Расписание по умолчанию (по Киеву). Админ меняет его в боте:
+# Отсутствующие (настройки) -> Расписание
+ABSENT_TIMES_DEFAULT = ((9, 0), (16, 0), (23, 0))
+ABSENT_MAX_TIMES = 24  # максимум опросов в день
+ABSENT_PRESETS = {  # готовые варианты: опросов в день -> время
+    1: ((9, 0),),
+    2: ((9, 0), (16, 0)),
+    3: ((9, 0), (16, 0), (23, 0)),
+    4: ((8, 0), (12, 0), (16, 0), (20, 0)),
+    6: ((8, 0), (10, 0), (12, 0), (14, 0), (16, 0), (18, 0)),
+}
 ABSENT_PER_PAGE = 100
 # Ширина колонок таблицы «Отсутствующие»:
 # Проект / Должность / ФИО / Причина / Даты / Телеграм. Длинный текст переносится.
@@ -888,6 +902,45 @@ def restore_confirm_text(path, label: str) -> str:
 # ───────────────────────── Отсутствующие (Hurma API) ─────────────────────────
 
 ABSENT_LOCK = asyncio.Lock()
+_absent_wakeup: asyncio.Event | None = None  # будит absent_loop при смене расписания
+
+
+def parse_times(text: str) -> list[tuple[int, int]] | None:
+    """«9:00, 13.30 18» -> [(9, 0), (13, 30), (18, 0)]. None — если формат неверный."""
+    tokens = [t for t in re.split(r"[\s,;]+", (text or "").strip()) if t]
+    if not tokens:
+        return None
+    out = set()
+    for t in tokens:
+        m = re.fullmatch(r"(\d{1,2})(?:[:.](\d{2}))?", t)
+        if not m:
+            return None
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        if h > 23 or mi > 59:
+            return None
+        out.add((h, mi))
+    return sorted(out) if len(out) <= ABSENT_MAX_TIMES else None
+
+
+def fmt_times(times) -> str:
+    return ", ".join(f"{h:02d}:{m:02d}" for h, m in times)
+
+
+def get_absent_times() -> tuple:
+    """Текущее расписание из базы (или по умолчанию)."""
+    parsed = parse_times(get_setting("absent_times"))
+    return tuple(parsed) if parsed else ABSENT_TIMES_DEFAULT
+
+
+def wake_absent_loop() -> None:
+    """Сообщает циклу автообновления, что расписание изменилось."""
+    if _absent_wakeup is not None:
+        _absent_wakeup.set()
+
+
+def save_absent_times(times) -> None:
+    set_setting("absent_times", fmt_times(times))  # не quiet -> попадёт в автокопию
+    wake_absent_loop()
 
 
 def hurma_headers(csrf: str, xsrf: str, cookie: str) -> dict:
@@ -998,9 +1051,10 @@ def _slot(day, h: int, m: int) -> datetime:
 
 
 def next_absent_slot(now: datetime) -> datetime:
+    times = get_absent_times()
     for d in (0, 1):
         day = (now + timedelta(days=d)).date()
-        for h, m in ABSENT_TIMES:
+        for h, m in times:
             t = _slot(day, h, m)
             if t > now:
                 return t
@@ -1008,9 +1062,10 @@ def next_absent_slot(now: datetime) -> datetime:
 
 
 def prev_absent_slot(now: datetime) -> datetime:
+    times = get_absent_times()
     for d in (0, -1):
         day = (now + timedelta(days=d)).date()
-        for h, m in reversed(ABSENT_TIMES):
+        for h, m in reversed(times):
             t = _slot(day, h, m)
             if t <= now:
                 return t
@@ -1018,7 +1073,9 @@ def prev_absent_slot(now: datetime) -> datetime:
 
 
 async def absent_loop(bot) -> None:
-    """Автообновление в 09:00, 16:00 и 23:00 (Киев). После перезапуска — догоняет пропуск."""
+    """Автообновление по расписанию из настроек (Киев). После перезапуска — догоняет пропуск."""
+    global _absent_wakeup
+    _absent_wakeup = asyncio.Event()
     try:
         at = float(get_setting("absent_at") or 0)
         if at < prev_absent_slot(datetime.now(TZ)).timestamp():
@@ -1028,7 +1085,15 @@ async def absent_loop(bot) -> None:
     while True:
         now = datetime.now(TZ)
         nxt = next_absent_slot(now)
-        await asyncio.sleep(max(1.0, (nxt - now).total_seconds()))
+        _absent_wakeup.clear()
+        try:
+            await asyncio.wait_for(
+                _absent_wakeup.wait(), timeout=max(1.0, (nxt - now).total_seconds())
+            )
+            log.info("Отсутствующие: расписание изменено -> %s", fmt_times(get_absent_times()))
+            continue  # расписание изменилось — пересчитываем следующий слот
+        except asyncio.TimeoutError:
+            pass
         try:
             await scheduled_absent_refresh(bot)
         except Exception:
@@ -1206,7 +1271,7 @@ async def show_absent_cfg(context, chat_id: int, replace: Message | None = None,
     """Настройки «Отсутствующих» — только администратор."""
     n = one("SELECT COUNT(*) AS n FROM absent_watch")["n"]
     at, err = get_setting("absent_at"), get_setting("absent_error")
-    times = ", ".join(f"{h:02d}:{m:02d}" for h, m in ABSENT_TIMES)
+    sched = get_absent_times()
     lines = [
         "🚫 <b>Отсутствующие — настройки</b>",
         "",
@@ -1216,7 +1281,7 @@ async def show_absent_cfg(context, chat_id: int, replace: Message | None = None,
     if err:
         lines.append(f"⚠️ Ошибка ({fmt_ts(get_setting('absent_error_at'))}): <i>{esc(err)}</i>")
     lines += [
-        f"⏰ Автообновление: {times} (Киев)",
+        f"⏰ Автообновление: {len(sched)} раз(а) в день — {fmt_times(sched)} (Киев)",
         "",
         f"x-csrf-token: {mask(get_setting('hurma_csrf'))}",
         f"x-xsrf-token: {mask(get_setting('hurma_xsrf'))}",
@@ -1236,9 +1301,34 @@ async def show_absent_cfg(context, chat_id: int, replace: Message | None = None,
             Btn("🔑 x-xsrf-token", callback_data="abs_tok:xsrf"),
         ],
         [Btn("🍪 Cookie", callback_data="abs_tok:cookie")],
+        [Btn("⏰ Расписание", callback_data="abs_sch")],
         [Btn("🔄 Обновить сейчас", callback_data="abs_upd:c")],
         [red_btn("🚫 Открыть таблицу", "abs")],
         [Btn("⬅️ Управление", callback_data="adm")],
+    ]
+    await render(context, chat_id, "\n".join(lines), Markup(rows), replace=replace)
+
+
+async def show_absent_sched(context, chat_id: int, replace: Message | None = None, note: str = ""):
+    """Расписание автообновления «Отсутствующих» — только администратор."""
+    times = get_absent_times()
+    nxt = next_absent_slot(datetime.now(TZ))
+    lines = [
+        "⏰ <b>Расписание обновления «Отсутствующих»</b>",
+        "",
+        f"Опросов в день: <b>{len(times)}</b>",
+        f"Время (Киев): <b>{fmt_times(times)}</b>",
+        f"Следующее обновление: {nxt.strftime('%d.%m %H:%M')}",
+        "",
+        "<i>Выберите готовый вариант (сколько раз в день) или задайте своё время.</i>",
+    ]
+    if note:
+        lines += ["", note]
+    presets = [Btn(f"{k}×", callback_data=f"abs_sch_set:{k}") for k in ABSENT_PRESETS]
+    rows = [
+        presets,
+        [Btn("✏️ Задать своё время", callback_data="abs_sch_edit")],
+        [Btn("⬅️ Настройки", callback_data="abs_cfg")],
     ]
     await render(context, chat_id, "\n".join(lines), Markup(rows), replace=replace)
 
@@ -1403,7 +1493,7 @@ MANAGER_CMDS = {
 ADMIN_CMDS = {
     "dep", "dep_t", "setimg", "rs_file",
     "abs_cfg", "abs_list", "abs_add", "abs_prj", "abs_del", "abs_del_yes",
-    "abs_tok", "abs_curl", "abs_upd",
+    "abs_tok", "abs_curl", "abs_upd", "abs_sch", "abs_sch_set", "abs_sch_edit",
 }
 
 
@@ -1678,6 +1768,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except TelegramError as e:
                         log.warning("Не удалось отправить страховочную копию: %s", e)
                 restore_from(path)
+                wake_absent_loop()  # в копии может быть другое расписание «Отсутствующих»
                 if source == "file":  # закреплённая копия должна совпасть с новым состоянием
                     _dirty["at"] = time.time()
                 log.info("Данные восстановлены (%s) пользователем %s", label, user.id)
@@ -1745,6 +1836,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Бот возьмёт x-csrf-token, x-xsrf-token и Cookie.\n\n🔒 Сообщение бот удалит.",
             ("abs_curl",), cancel="abs_cfg",
         )
+    elif cmd == "abs_sch":
+        await show_absent_sched(context, chat_id, replace=msg)
+    elif cmd == "abs_sch_set":
+        preset = ABSENT_PRESETS.get(int(a[0])) if a and a[0].isdigit() else None
+        note = ""
+        if preset:
+            save_absent_times(preset)
+            note = f"✅ Сохранено: {len(preset)} раз(а) в день — {fmt_times(preset)}."
+        await show_absent_sched(context, chat_id, replace=msg, note=note)
+    elif cmd == "abs_sch_edit":
+        await ask(
+            context, chat_id, msg,
+            "Отправьте <b>время опросов</b> (по Киеву) через запятую или пробел.\n"
+            "Количество опросов в день = количество указанных времён "
+            f"(от 1 до {ABSENT_MAX_TIMES}).\n\n"
+            "Пример: <code>9:00, 12:30, 18:00</code>\n"
+            f"Сейчас: <code>{fmt_times(get_absent_times())}</code>",
+            ("abs_times",), cancel="abs_sch",
+        )
     elif cmd == "abs_upd":
         await render(context, chat_id, "⏳ Запрашиваю данные в Hurma…", None, replace=msg)
         err = await refresh_absent()
@@ -1806,6 +1916,21 @@ async def on_absent_text(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
             note = f"✅ {name} обновлён."
         context.user_data.pop("state", None)
         return await show_absent_cfg(context, chat_id, note=note)
+
+    if kind == "abs_times":  # своё расписание автообновления
+        times = parse_times(text)
+        if times is None:
+            return await update.message.reply_text(
+                "Не удалось разобрать время. Формат: ЧЧ:ММ через запятую, "
+                f"например 9:00, 13:30, 18:00 (от 1 до {ABSENT_MAX_TIMES} значений).",
+                reply_markup=Markup([[Btn("✖️ Отмена", callback_data="abs_sch")]]),
+            )
+        save_absent_times(times)
+        context.user_data.pop("state", None)
+        return await show_absent_sched(
+            context, chat_id,
+            note=f"✅ Сохранено: {len(times)} раз(а) в день — {fmt_times(times)}.",
+        )
 
     new = context.user_data.get("abs_new")
 
@@ -2173,10 +2298,7 @@ async def post_init(app: Application) -> None:
         app.bot_data["backup_task"] = asyncio.create_task(backup_loop(app.bot))
         log.info("Автокопии включены: после изменений данных копия уходит админам и закрепляется")
     app.bot_data["absent_task"] = asyncio.create_task(absent_loop(app.bot))
-    log.info(
-        "Отсутствующие: автообновление в %s (Киев)",
-        ", ".join(f"{h:02d}:{m:02d}" for h, m in ABSENT_TIMES),
-    )
+    log.info("Отсутствующие: автообновление в %s (Киев)", fmt_times(get_absent_times()))
 
 
 def main():
